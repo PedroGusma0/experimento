@@ -2,3 +2,8 @@ torch
 transformers
 pandas
 tqdm
+# jlens (the interpretability package at the repo root) is used by
+# run_guardrail_jlens.py / jlens_readout.py. Install it editable into this venv:
+#   .venv\Scripts\python -m pip install -e ..
+# It also pulls numpy + huggingface_hub. Not pinned here because it lives in
+# this same repo and is installed from source, not from PyPI.
