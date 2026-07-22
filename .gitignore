@@ -12,3 +12,7 @@ dist/
 *.pt
 slice*.html
 slices/
+
+# promtps
+zero_exp.md
+second_exp.md
