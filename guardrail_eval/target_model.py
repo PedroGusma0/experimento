@@ -20,10 +20,18 @@ MODEL_ID = "google/gemma-3-1b-it"
 class TargetModel:
     """gemma-3-1b-it loaded once and reused across generate() calls."""
 
-    def __init__(self, model_id: str = MODEL_ID, *, dtype: torch.dtype = torch.float32) -> None:
+    def __init__(
+        self,
+        model_id: str = MODEL_ID,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: str = "cpu",
+    ) -> None:
         self.tok = transformers.AutoTokenizer.from_pretrained(model_id)
         self.hf = transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+        self.hf.to(device)
         self.hf.eval()
+        self.device = device
 
     def __repr__(self) -> str:
         return f"TargetModel({type(self.hf).__name__})"
@@ -37,6 +45,7 @@ class TargetModel:
             return_tensors="pt",
             return_dict=True,
         )
+        encoded = encoded.to(self.device)
         with torch.no_grad():
             output_ids = self.hf.generate(
                 **encoded,

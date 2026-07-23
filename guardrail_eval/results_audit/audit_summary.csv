@@ -1,0 +1,2 @@
+claim_id,n,mean_score,mean_correctness,mean_evidence_quality,investigator_accuracy
+specificity_false_positive,2,10.0,10.0,10.0,1.0

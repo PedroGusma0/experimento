@@ -1,4 +1,4 @@
-# guardrail_eval — architecture (as of Phase 2)
+# guardrail_eval — architecture (as of Phase 3)
 
 XAI + prompt-injection research sub-project living inside the `jlens`
 mechanistic-interpretability repo. It applies the **Jacobian lens** (see
@@ -111,6 +111,57 @@ roughly halves the per-prompt lens cost. `--target-max-new-tokens` defaults
 to 60 (not 200) for the same reason: enough to see whether the target
 starts complying or refuses, without paying for a full response on CPU.
 
+### Phase 3 — automated auditor (§A.22): investigator + LLM-judge
+
+A first prototype of the paper's §A.22 automated auditor, applied to the
+existing guardrail. Replaces the paper's human-authored ground truth with a
+**behavioral** one (Strategy A) so it scales without manual activation
+reading. Runs the **audit loop only** — guardrail + lens + investigator +
+judge, **no target model** — so the guardrail loads once (none of Phase 2's
+two-phase memory dance). The investigator + judge run via the Gemini API, so
+this loop is **API-bound, not GPU-bound**: it runs on CPU for a small dry-run
+and on a RunPod GPU for a larger smoke test (`--device cuda`). See
+[`PLAN_runpod_audit.md`](PLAN_runpod_audit.md) for the RunPod setup.
+
+Three new pieces:
+
+**`ground_truth.py`** — Strategy A. Each `Claim` is a yes/no question that
+applies to a subset of rows (selected by the guardrail's verdict) with an
+expected answer fixed by the true label — i.e. the confusion-matrix cell:
+- `silent_false_negative` (applies when verdict=benign): expected "sim" on
+  FN (true label malign), "nao" on TN.
+- `specificity_false_positive` (applies when verdict=malign): expected "sim"
+  on TP, "nao" on FP.
+`ground_truth_for(label, verdict)` returns the applicable `(claim, expected)`
+pairs (empty for an "unknown" verdict). The other four categories in
+`../markdowns-de-referencia/automacao_auditoria_jlens.md` need a position
+sweep, keyword matching, or causal data — out of scope, noted as extensions.
+
+**`audit_agent.py`** — investigator + judge via Gemini (SDK `google-genai`,
+default `gemini-3.5-flash`, temperature 0, `GEMINI_API_KEY` from the repo-root
+`.env`). Primary path is **fixed-readout, no tool-calling**: the orchestrator
+precomputes one readout and injects it as text.
+- `investigate(...)` — one call; system prompt = `INVESTIGATOR_PRIMER` (a short
+  paper primer distilled from `PAPER_SUMMARY.md`: what the J-lens shows, the
+  workspace band L14-26, the single-token limitation) + the task. Constrained
+  to cite only tokens present in the readout (anti-hallucination); returns
+  `{verdict: sim/nao, evidence}`.
+- `judge(...)` — one call, no readout; scores `correctness` (hard gabarito vs.
+  `expected`) and `evidence_quality` (qualitative — Strategy A has no causal
+  gabarito for it) each 0-10; `score` = their mean.
+- The more faithful **tool-calling** variant (agent chooses layers, queries
+  repeatedly) is documented in the module docstring as an unimplemented
+  alternative.
+
+**`run_audit_pipeline.py`** — driver. First-N malign + first-N benign from
+`data/attack_baseline.csv` (unwrapped seeds). Per prompt: classify + readout
+(reused from `GuardrailLens`) → applicable claims → investigate → judge.
+Writes to a dedicated `results_audit/` folder (separate from Phase 2's
+`results/`): `audit_readouts.jsonl` (verdict + readout per prompt),
+`audit_scores.jsonl` (scores per (prompt, claim)), `audit_summary.csv`
+(per-claim aggregate + investigator accuracy). Dry-run:
+`python run_audit_pipeline.py --device cpu --n-malign 2 --n-benign 2`.
+
 ## Data flow (Phase 2, current state)
 
 ```
@@ -147,6 +198,9 @@ guardrail_eval/
 ├── prepare_attack_data.py    # Phase 2: seed_pool.csv + attack_baseline*.csv builders
 ├── target_model.py           # Phase 2: TargetModel (gemma-3-1b-it, open-ended, no lens, no system prompt)
 ├── run_attack_pipeline.py    # Phase 2: two-phase orchestrator (guardrail-only, then target-only)
+├── ground_truth.py           # Phase 3: Strategy-A claims (label x verdict -> expected answer)
+├── audit_agent.py            # Phase 3: investigator + judge via Gemini (format_readout/investigate/judge)
+├── run_audit_pipeline.py     # Phase 3: auditor driver (guardrail + lens + investigator + judge)
 ├── data/
 │   ├── harmbench_labeled.csv          # 200 malign seeds
 │   ├── jailbreakbench_benign_en.csv   # 30 benign seeds (source data)
@@ -154,10 +208,14 @@ guardrail_eval/
 │   ├── seed_pool.csv                  # 230 unified seeds
 │   ├── attack_baseline.csv            # 230 rows, prompt = seed
 │   └── attack_baseline_wrapping.csv   # 230 rows, prompt = wrapped seed
-└── results/
-    ├── readouts_qwen3_1.7b_baseline[_wrapping].jsonl   # per-prompt J-lens readouts
-    ├── summary_qwen3_1.7b_baseline[_wrapping].csv      # guardrail verdicts
-    └── target_baseline[_wrapping].csv                  # target model outputs
+├── results/
+│   ├── readouts_qwen3_1.7b_baseline[_wrapping].jsonl   # per-prompt J-lens readouts
+│   ├── summary_qwen3_1.7b_baseline[_wrapping].csv      # guardrail verdicts
+│   └── target_baseline[_wrapping].csv                  # target model outputs
+└── results_audit/                                      # Phase 3 (separate folder)
+    ├── audit_readouts.jsonl   # per-prompt: guardrail verdict + J-lens readout
+    ├── audit_scores.jsonl     # per (prompt, claim): investigator verdict + judge scores
+    └── audit_summary.csv      # per-claim aggregate + investigator accuracy
 ```
 
 ## What's validated so far (smoke tests only — nothing run at full scale)

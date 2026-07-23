@@ -66,10 +66,16 @@ class GuardrailLens:
         lens_file: str = LENS_FILE,
         lens_revision: str = LENS_REVISION,
         dtype: torch.dtype = torch.float32,
+        device: str = "cpu",
     ) -> None:
         self.hf = transformers.AutoModelForCausalLM.from_pretrained(
             model_id, dtype=dtype
         )
+        # jlens is device-agnostic but expects the model already placed: from_hf
+        # reads params where they are, and encode()/transport()/unembed() follow
+        # the model's device. Move before wrapping so input_device resolves to
+        # the target device (e.g. "cuda" on RunPod).
+        self.hf.to(device)
         self.hf.eval()
         self.tok = transformers.AutoTokenizer.from_pretrained(model_id)
         # force_bos=False: Qwen3's tokenizer sets add_bos_token=false and the
