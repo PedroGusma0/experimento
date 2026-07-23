@@ -163,11 +163,36 @@ terminal integrado rodando no host remoto).
 4. Levar o `.env` com `GEMINI_API_KEY` pro pod manualmente (arrastar pelo
    explorer remoto do VSCode ou colar o conteúdo direto num arquivo criado
    no pod) — nunca via git, já que não estava no `.gitignore` até agora.
-5. Rodar `python run_audit_pipeline.py --device cuda --dtype bfloat16
-   --n-malign 5 --n-benign 5` (pelo terminal integrado do VSCode) e
-   inspecionar `results/audit_scores.jsonl`.
+5. Rodar, **trocando o guardrail para gemma-3-4b-it** (via `--guardrail-model`;
+   o preset já resolve a lente e os quirks de carregamento):
+   ```
+   python run_audit_pipeline.py --guardrail-model google/gemma-3-4b-it \
+       --device cuda --dtype bfloat16 --n-malign 5 --n-benign 5 --verbose
+   ```
+   e inspecionar `results_audit/audit_scores.jsonl`.
 6. Derrubar o pod depois de validar (billing por minuto) — encerrar a
    sessão Remote-SSH e terminar o pod pelo dashboard do RunPod.
+
+### Troca do guardrail para gemma-3-4b-it (a fazer no pod)
+
+O código já suporta a troca via `PRESETS` em `jlens_readout.py` (basta
+`--guardrail-model google/gemma-3-4b-it`). Lente confirmada existente:
+`gemma-3-4b-it/jlens/Salesforce-wikitext/gemma-3-4b-it_jacobian_lens.pt` no
+mesmo repo `neuronpedia/jacobian-lens`. Diferenças em relação ao Qwen3 já
+tratadas no preset: carregamento via `AutoModelForImageTextToText`
+(gemma-3-4b é multimodal, fora do auto-map de CausalLM), `force_bos=True`,
+sem `enable_thinking`. **Só é rodável na GPU** (~8GB em bf16, não cabe nos
+7.7GB de RAM da máquina local — por isso a troca é exclusiva do pod).
+
+**Verificar no PRIMEIRO run no pod (não testável localmente):**
+- Se `AutoModelForImageTextToText` carrega e o `jlens.from_hf` acha o text
+  decoder (layout `language_model`). Se falhar, passar `layout=` explícito.
+- Se o chat template do gemma-3 aceita `role: "system"`. O template do
+  gemma-2 **não** aceitava (levantava erro). Se o gemma-3 também não aceitar,
+  dobrar o `SYSTEM_PROMPT` no início do turno `user` em `chat_prompt`.
+- Que a posição de decisão (`-1`) e a workspace band fazem sentido para o
+  gemma-3-4b (28 camadas de texto? conferir `source_layers` da lente e
+  ajustar `--layers` se necessário — o default L14-26 foi calibrado no Qwen3).
 
 ## Verificação
 

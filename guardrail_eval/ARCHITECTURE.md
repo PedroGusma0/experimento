@@ -46,6 +46,20 @@ fitted layers, d_model=2048). Two Qwen3-specific gotchas are baked in:
 eats the token budget before any verdict) and `force_bos=False` (Qwen3's
 tokenizer already sets `add_bos_token=false`).
 
+The guardrail model is now **preset-selectable** via `PRESETS` (a
+`{model_id: GuardrailPreset}` registry in `jlens_readout.py`): each preset
+pairs a model with its lens file and the loading quirks that must move with
+it (`force_bos`, `disable_thinking`, and which HF auto-class loads it).
+Two presets ship: `Qwen/Qwen3-1.7B` (default, the only one that fits the
+local CPU machine) and `google/gemma-3-4b-it` — the intended RunPod guardrail,
+a multimodal checkpoint loaded via `AutoModelForImageTextToText` (~8GB bf16,
+GPU-only), with its own lens
+(`gemma-3-4b-it/jlens/Salesforce-wikitext/gemma-3-4b-it_jacobian_lens.pt`).
+Pick one with `--guardrail-model`. The gemma path is not yet verified
+end-to-end (can't run locally) — see `PLAN_runpod_audit.md` for the gemma
+gotchas to confirm on the first pod run (system-role support, layout
+detection, workspace band).
+
 Three methods do the work:
 - `chat_prompt(seed)` — renders the classifier system prompt +
   `"INPUT: {seed}\n\nClassification:"` as a string via the chat template.
