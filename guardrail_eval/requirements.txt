@@ -2,8 +2,10 @@ torch
 transformers
 pandas
 tqdm
-# audit pipeline (run_audit_pipeline.py): investigator + judge via Gemini
-google-genai
+# audit pipeline (run_audit_pipeline.py):
+#   investigator = DeepSeek via NVIDIA endpoint (OpenAI SDK); judge = Groq (gpt-oss-120b)
+openai
+groq
 python-dotenv
 # jlens (the interpretability package at the repo root) is used by
 # run_guardrail_jlens.py / jlens_readout.py. Install it editable into this venv:

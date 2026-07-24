@@ -1,16 +1,21 @@
-import os
-from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 
-# Carrega as variáveis de ambiente do arquivo .env
-load_dotenv()
-
-# O SDK inicializa buscando automaticamente a variável GEMINI_API_KEY
-client = genai.Client()
-
-response = client.models.generate_content(
-    model="gemini-2.5-flash",
-    contents="Explique o que é uma variável de ambiente em uma frase.",
+client = Groq()
+completion = client.chat.completions.create(
+    model="openai/gpt-oss-120b",
+    messages=[
+      {
+        "role": "user",
+        "content": ""
+      }
+    ],
+    temperature=1,
+    max_completion_tokens=2048,
+    top_p=1,
+    reasoning_effort="medium",
+    stream=True,
+    stop=None
 )
 
-print(response.text)
+for chunk in completion:
+    print(chunk.choices[0].delta.content or "", end="")

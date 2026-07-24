@@ -2,7 +2,7 @@
 
 XAI + prompt-injection research sub-project living inside the `jlens`
 mechanistic-interpretability repo. It applies the **Jacobian lens** (see
-[`../PAPER_SUMMARY.md`](../PAPER_SUMMARY.md)) to a small "guardrail" LLM to
+[`PAPER_SUMMARY.md`](PAPER_SUMMARY.md)) to a small "guardrail" LLM to
 explain *what internal features drive its malign/benign verdict* on incoming
 prompts — including prompts wrapped in jailbreak/injection templates — and
 observes what happens downstream when a target LLM receives those same
@@ -60,15 +60,25 @@ end-to-end (can't run locally) — see `PLAN_runpod_audit.md` for the gemma
 gotchas to confirm on the first pod run (system-role support, layout
 detection, workspace band).
 
-Three methods do the work:
+Core methods:
 - `chat_prompt(seed)` — renders the classifier system prompt +
   `"INPUT: {seed}\n\nClassification:"` as a string via the chat template.
 - `classify(prompt_str)` — greedy-generates the verdict, parses
   `malign`/`benign`/`unknown`.
 - `readout(prompt_str, position=-1)` — applies `jlens.JacobianLens.apply()`
-  and returns the top-K J-lens tokens **per layer at the decision
-  position** (the guardrail is never gated/blocked on this — it's read
-  purely for explanation).
+  and returns the top-K J-lens tokens **per layer at a single position**
+  (default the decision position; the guardrail is never gated/blocked on
+  this — it's read purely for explanation).
+- `readout_multi(prompt_str, positions=None)` (added for Phase 3) — the
+  multi-position counterpart: same topk-per-layer logic (shared via a
+  private `_topk_per_layer_position` helper), but for an arbitrary list of
+  positions at once, returning `{layer: {position: [...]}}`. Lets a caller
+  trace how a concept's readout changes across the prompt, not just at one
+  point in time.
+- `token_span(prompt_str, last_n=None)` (added for Phase 3) — decoded
+  `(position, token)` pairs for the prompt (optionally windowed to the last
+  N), used to brief the investigator agent on what's tokenized where so it
+  can pick meaningful positions for `readout_multi` instead of guessing.
 
 `run_guardrail_jlens.py` drives this over `data/harmbench_labeled.csv`.
 Validated in a 5-prompt smoke test: 5/5 correct classifications, and the
@@ -132,10 +142,10 @@ existing guardrail. Replaces the paper's human-authored ground truth with a
 **behavioral** one (Strategy A) so it scales without manual activation
 reading. Runs the **audit loop only** — guardrail + lens + investigator +
 judge, **no target model** — so the guardrail loads once (none of Phase 2's
-two-phase memory dance). The investigator + judge run via the Gemini API, so
-this loop is **API-bound, not GPU-bound**: it runs on CPU for a small dry-run
-and on a RunPod GPU for a larger smoke test (`--device cuda`). See
-[`PLAN_runpod_audit.md`](PLAN_runpod_audit.md) for the RunPod setup.
+two-phase memory dance). The investigator (DeepSeek) and judge (Groq) run via
+API, so this loop is **API-bound, not GPU-bound**: it runs on CPU for a small
+dry-run and on a RunPod GPU for a larger smoke test (`--device cuda`). See
+[`PLAN_runpod_audit.md`](../guardrail_eval/PLAN_runpod_audit.md) for the RunPod setup.
 
 Three new pieces:
 
@@ -147,34 +157,74 @@ expected answer fixed by the true label — i.e. the confusion-matrix cell:
 - `specificity_false_positive` (applies when verdict=malign): expected "sim"
   on TP, "nao" on FP.
 `ground_truth_for(label, verdict)` returns the applicable `(claim, expected)`
-pairs (empty for an "unknown" verdict). The other four categories in
-`../markdowns-de-referencia/automacao_auditoria_jlens.md` need a position
-sweep, keyword matching, or causal data — out of scope, noted as extensions.
+pairs (empty for an "unknown" verdict). The investigator can now probe
+multiple positions while resolving these two claims (see `audit_agent.py`
+below), but no new *claim types* were added — "momento de emergência" and
+"deliberação interna" from `automacao_auditoria_jlens.md` would need new
+`Claim` entries built around a position sweep, which the underlying capability
+now supports but `ground_truth.py` doesn't yet use. "Robustez a disfarce"
+still needs the wrapping corpus; both remain out of scope, noted as extensions.
 
-**`audit_agent.py`** — investigator + judge via Gemini (SDK `google-genai`,
-default `gemini-3.5-flash`, temperature 0, `GEMINI_API_KEY` from the repo-root
-`.env`). Primary path is **fixed-readout, no tool-calling**: the orchestrator
-precomputes one readout and injects it as text.
-- `investigate(...)` — one call; system prompt = `INVESTIGATOR_PRIMER` (a short
+**`audit_agent.py`** — investigator + judge, **cross-provider by design**
+(different providers for the two roles cut the self-evaluation bias seen when
+one model grades its own family's answers). Temperature 0 throughout.
+- `investigate(...)` — **DeepSeek** (`deepseek-ai/deepseek-v4-pro` via NVIDIA's
+  OpenAI-compatible endpoint; key `DEEPSEEK_API_KEY`/`DEEPSSEK_API_KEY`).
+  **Primary path is interactive tool-calling, multi-position**: the
+  investigator is shown a `token_span` map (position→token) of the guardrail's
+  prompt and, on its own judgment, calls a `get_jlens_readout(positions,
+  layers)` function tool (OpenAI-compatible schema, `READOUT_TOOL_SCHEMA`) as
+  many times as it wants, up to `--max-tool-calls` (default 5 — a starting
+  guess, meant to be tuned empirically once there's infrastructure to observe
+  convergence). Each call is served locally against `GuardrailLens.readout_multi`
+  (via a `readout_fn` closure bound by `run_audit_pipeline.py`) and fed back as
+  a tool-response message. Once it stops calling the tool (or hits the cap), a
+  final call (no tools, JSON mode) forces the structured verdict
+  `{verdict: sim/nao, evidence}`. System prompt = `INVESTIGATOR_PRIMER` (a short
   paper primer distilled from `PAPER_SUMMARY.md`: what the J-lens shows, the
-  workspace band L14-26, the single-token limitation) + the task. Constrained
-  to cite only tokens present in the readout (anti-hallucination); returns
-  `{verdict: sim/nao, evidence}`.
-- `judge(...)` — one call, no readout; scores `correctness` (hard gabarito vs.
-  `expected`) and `evidence_quality` (qualitative — Strategy A has no causal
-  gabarito for it) each 0-10; `score` = their mean.
-- The more faithful **tool-calling** variant (agent chooses layers, queries
-  repeatedly) is documented in the module docstring as an unimplemented
-  alternative.
+  workspace band L14-26, the single-token limitation, and that reasoning
+  unfolds across positions) + the task; constrained to cite only tokens the
+  tool actually returned (anti-hallucination).
+  **Fallback**: if the very first tool-enabled API call fails outright (e.g.
+  the DeepSeek/NVIDIA endpoint rejects `tools` for this model), `investigate`
+  automatically drops to `_investigate_fixed` — a single fixed readout at
+  position -1, the pipeline's original non-interactive design — instead of
+  failing the row. Both paths report `tool_calls` (int) and `fallback_used`
+  (bool) in the result for auditability. **Not yet validated end-to-end**
+  (can't run locally, no GPU/low infra) — see `PLAN_runpod_audit.md` for what
+  to confirm on the first pod run.
+- `judge(...)` — **Groq** (`openai/gpt-oss-120b`; key `GROQ_API_KEY`/`GPT_API_KEY`),
+  no readout access; scores `correctness` (hard gabarito vs. `expected`) and
+  `evidence_quality` (qualitative — Strategy A has no causal gabarito for it)
+  each 0-10; `score` = their mean.
+- Both roles use JSON mode + pydantic validation, with retry and a recorded
+  fallback (an `error` field) so one bad API call doesn't sink a long run.
 
-**`run_audit_pipeline.py`** — driver. First-N malign + first-N benign from
-`data/attack_baseline.csv` (unwrapped seeds). Per prompt: classify + readout
-(reused from `GuardrailLens`) → applicable claims → investigate → judge.
-Writes to a dedicated `results_audit/` folder (separate from Phase 2's
-`results/`): `audit_readouts.jsonl` (verdict + readout per prompt),
-`audit_scores.jsonl` (scores per (prompt, claim)), `audit_summary.csv`
-(per-claim aggregate + investigator accuracy). Dry-run:
-`python run_audit_pipeline.py --device cpu --n-malign 2 --n-benign 2`.
+**`run_audit_pipeline.py`** — driver. Runs over one or both attack corpora
+(`--attack {baseline,baseline-wrapping,both}`, default `both`, mirroring
+`run_attack_pipeline.py`'s `slug()`/`out_paths(attack)`/`select_subset(attack,
+...)` pattern), First-N malign + first-N benign per attack (`--n-malign`/
+`--n-benign`, default **15/15** — a reduced "main run" size, not the full
+230-row corpus, chosen to bound free-tier API cost). Per prompt: classify +
+an anchor readout at the decision position (`GuardrailLens.readout`,
+unchanged, logged for continuity) → applicable claims → investigate
+(interactive, via `readout_fn`/`token_span_text` built from `readout_multi`/
+`token_span`) → judge. `--top-k` default is now **25** (was 10, matching
+`automacao_auditoria_jlens.md`'s §3 suggestion). Since a row triggers at most
+one claim, total API calls scale close to linearly with prompt count (~3-7
+calls/claim with interactive tool-calling) — two knobs exist to keep a larger
+run survivable: `--api-pacing-seconds` (sleep between each investigate+judge
+cycle) and `--resume` (skip `pool_index` rows already in that attack's
+`audit_readouts_<attack>.jsonl`, appending instead of overwriting — the
+readout write happens before the API/claim step, so it's the safe checkpoint
+for skipping already-done GPU work). Writes to a dedicated `results_audit/`
+folder (separate from Phase 2's `results/`), **one set of files per attack**:
+`audit_readouts_<attack>.jsonl` (verdict + anchor readout per prompt),
+`audit_scores_<attack>.jsonl` (scores per (prompt, claim), including
+`tool_calls` and `fallback_used`), `audit_summary_<attack>.csv` (per-claim
+aggregate + investigator accuracy); with `--attack both`, an additional
+`audit_summary_combined.csv` aggregates across both. Dry-run:
+`python run_audit_pipeline.py --device cpu --attack baseline --n-malign 2 --n-benign 2`.
 
 ## Data flow (Phase 2, current state)
 
@@ -213,8 +263,9 @@ guardrail_eval/
 ├── target_model.py           # Phase 2: TargetModel (gemma-3-1b-it, open-ended, no lens, no system prompt)
 ├── run_attack_pipeline.py    # Phase 2: two-phase orchestrator (guardrail-only, then target-only)
 ├── ground_truth.py           # Phase 3: Strategy-A claims (label x verdict -> expected answer)
-├── audit_agent.py            # Phase 3: investigator + judge via Gemini (format_readout/investigate/judge)
+├── audit_agent.py            # Phase 3: investigator (DeepSeek) + judge (Groq gpt-oss-120b) (format_readout/investigate/judge)
 ├── run_audit_pipeline.py     # Phase 3: auditor driver (guardrail + lens + investigator + judge)
+├── setup_pod.sh              # Phase 3: idempotent pod setup (matched-index torch/torchvision/torchaudio fix + installs)
 ├── data/
 │   ├── harmbench_labeled.csv          # 200 malign seeds
 │   ├── jailbreakbench_benign_en.csv   # 30 benign seeds (source data)
@@ -226,10 +277,11 @@ guardrail_eval/
 │   ├── readouts_qwen3_1.7b_baseline[_wrapping].jsonl   # per-prompt J-lens readouts
 │   ├── summary_qwen3_1.7b_baseline[_wrapping].csv      # guardrail verdicts
 │   └── target_baseline[_wrapping].csv                  # target model outputs
-└── results_audit/                                      # Phase 3 (separate folder)
-    ├── audit_readouts.jsonl   # per-prompt: guardrail verdict + J-lens readout
-    ├── audit_scores.jsonl     # per (prompt, claim): investigator verdict + judge scores
-    └── audit_summary.csv      # per-claim aggregate + investigator accuracy
+└── results_audit/                                      # Phase 3 (separate folder), one set per attack
+    ├── audit_readouts_baseline[_wrapping].jsonl   # per-prompt: guardrail verdict + J-lens readout
+    ├── audit_scores_baseline[_wrapping].jsonl     # per (prompt, claim): investigator verdict + judge scores
+    ├── audit_summary_baseline[_wrapping].csv      # per-claim aggregate + investigator accuracy
+    └── audit_summary_combined.csv                 # cross-attack aggregate (only when --attack both)
 ```
 
 ## What's validated so far (smoke tests only — nothing run at full scale)

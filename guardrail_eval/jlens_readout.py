@@ -217,13 +217,42 @@ class GuardrailLens:
         )
         return parse_label(raw), raw
 
+    def _topk_per_layer_position(
+        self,
+        prompt_str: str,
+        *,
+        layers: list[int] | None,
+        positions: list[int],
+        top_k: int,
+    ) -> dict[int, dict[int, list[dict]]]:
+        """Shared readout core: one ``lens.apply`` call, topk per (layer, position).
+
+        ``JacobianLens.apply`` already supports a list of positions (including
+        negative indices, via advanced indexing) -- nothing in ``jlens/`` needs
+        to change for multi-position reads. Returns
+        ``{layer: {position: [{"tok": str, "score": float}, ...]}}``.
+        """
+        lens_logits, _, _ = self.lens.apply(
+            self.model, prompt_str, layers=layers, positions=positions
+        )
+        result: dict[int, dict[int, list[dict]]] = {}
+        for layer, logits in lens_logits.items():  # logits: [n_positions, vocab]
+            result[int(layer)] = {}
+            for i, position in enumerate(positions):
+                top = logits[i].topk(top_k)
+                result[int(layer)][position] = [
+                    {"tok": self.tok.decode([int(t)]), "score": float(s)}
+                    for t, s in zip(top.indices, top.values, strict=True)
+                ]
+        return result
+
     def readout(
         self,
         prompt_str: str,
         *,
         layers: list[int] | None = None,
         position: int = -1,
-        top_k: int = 10,
+        top_k: int = 25,
     ) -> dict[int, list[dict]]:
         """Top-K J-lens tokens per layer at a single decision position.
 
@@ -236,14 +265,58 @@ class GuardrailLens:
         Returns:
             ``{layer: [{"tok": str, "score": float}, ...]}`` (J-lens only).
         """
-        lens_logits, _, _ = self.lens.apply(
-            self.model, prompt_str, layers=layers, positions=[position]
+        multi = self._topk_per_layer_position(
+            prompt_str, layers=layers, positions=[position], top_k=top_k
         )
-        result: dict[int, list[dict]] = {}
-        for layer, logits in lens_logits.items():
-            top = logits[0].topk(top_k)  # logits: [1, vocab] -> row 0
-            result[int(layer)] = [
-                {"tok": self.tok.decode([int(t)]), "score": float(s)}
-                for t, s in zip(top.indices, top.values, strict=True)
-            ]
-        return result
+        return {layer: per_position[position] for layer, per_position in multi.items()}
+
+    def readout_multi(
+        self,
+        prompt_str: str,
+        *,
+        layers: list[int] | None = None,
+        positions: list[int] | None = None,
+        top_k: int = 25,
+    ) -> dict[int, dict[int, list[dict]]]:
+        """Top-K J-lens tokens per (layer, position), for an arbitrary set of
+        positions -- the multi-position counterpart to :meth:`readout`, used by
+        the interactive investigator tool so it can probe wherever in the
+        prompt it judges relevant (see :meth:`token_span`).
+
+        Args:
+            layers: Layers to read at. ``None`` reads every fitted layer.
+            positions: Sequence positions to read at. ``None`` defaults to
+                ``[-1]`` (same default as :meth:`readout`).
+            top_k: How many top tokens to keep per (layer, position).
+
+        Returns:
+            ``{layer: {position: [{"tok": str, "score": float}, ...]}}``.
+        """
+        if positions is None:
+            positions = [-1]
+        return self._topk_per_layer_position(
+            prompt_str, layers=layers, positions=positions, top_k=top_k
+        )
+
+    def token_span(
+        self, prompt_str: str, *, last_n: int | None = None
+    ) -> list[dict]:
+        """Decoded (position, token) pairs for ``prompt_str``.
+
+        Briefs the investigator on what's tokenized where, so it can choose
+        meaningful positions to probe via :meth:`readout_multi` instead of
+        guessing blindly. ``last_n`` keeps only the last N positions (a window
+        around ``INPUT: {seed}...Classification:``, so the boilerplate system
+        prompt doesn't drown the actual input) -- ``None`` returns every
+        position.
+
+        Returns:
+            ``[{"position": int, "token": str}, ...]``, positions ascending.
+        """
+        input_ids = self.model.encode(prompt_str)[0]
+        n = int(input_ids.shape[0])
+        start = 0 if last_n is None else max(0, n - last_n)
+        return [
+            {"position": i, "token": self.tok.decode([int(input_ids[i])])}
+            for i in range(start, n)
+        ]
