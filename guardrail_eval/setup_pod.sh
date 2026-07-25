@@ -1,54 +1,82 @@
 #!/usr/bin/env bash
 # Pod setup for guardrail_eval, run once (idempotent) before run_audit_pipeline.py.
 #
-# Fixes a dependency trap hit in a prior RunPod session: the pod's official
-# PyTorch template (runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04)
-# ships torch 2.4.0, but jlens requires transformers>=5.5 -- 5.14.1
-# specifically imports `torch.distributed.tensor.DTensor`, unavailable in
-# torch 2.4.0 (ImportError). Upgrading torch alone (as done manually last
-# time) then breaks torchvision/torchaudio's compiled extensions against the
-# new torch ABI (`operator torchvision::nms does not exist`, then an
-# `undefined symbol` in libtorchaudio.so) -- each isolated fix broke the next
-# because torch/torchvision/torchaudio must be installed together, from the
-# same CUDA-matched wheel index, not one at a time.
+# Fixes a dependency trap hit in a prior RunPod session: an older pod
+# template (runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04) shipped
+# torch 2.4.0, but jlens requires transformers>=5.5 -- 5.14.1 specifically
+# imports `torch.distributed.tensor.DTensor`, unavailable in torch 2.4.0
+# (ImportError). Upgrading torch alone (as done manually that time) then
+# broke torchvision/torchaudio's compiled extensions against the new torch
+# ABI (`operator torchvision::nms does not exist`, then an `undefined
+# symbol` in libtorchaudio.so).
+#
+# The actual pod template varies between sessions (this repo has run on both
+# a 2.4.0/cu124 and a 2.8.0/cu128 template so far) -- so this script does
+# NOT hardcode a CUDA wheel index. If a reinstall is needed, the index is
+# derived from whatever CUDA build the pod's own torch already reports
+# (`torch.version.cuda`), so it can never silently downgrade/mismatch a
+# newer template the way a hardcoded cu124 index would. It also no longer
+# gates on torchvision/torchaudio -- neither is an actual dependency of
+# jlens or guardrail_eval (check requirements.txt/pyproject.toml), so a
+# template that simply doesn't ship them shouldn't trigger a reinstall at
+# all; they're checked informationally only, after the real gate passes.
 #
 # Usage: bash guardrail_eval/setup_pod.sh   (run from anywhere; cds to repo root)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$HERE")"
-CUDA_INDEX_URL="https://download.pytorch.org/whl/cu124"
 
+# The real gate: transformers (what jlens needs) importing cleanly, including
+# the specific DTensor path that broke on torch 2.4.0.
 self_test() {
     python -c "
 from torch.distributed.tensor import DTensor
-import torchvision
-import torchaudio
-print('deps OK')
+import transformers
+print('torch/transformers OK')
+"
+}
+
+# Wheel index matched to *this* pod's actual CUDA build, not a hardcoded
+# guess -- e.g. torch.version.cuda == '12.8' -> .../whl/cu128.
+cuda_index_url() {
+    python -c "
+import torch
+v = torch.version.cuda
+if not v:
+    raise SystemExit('torch has no CUDA build (torch.version.cuda is None) -- not a GPU pod?')
+major, minor = v.split('.')[:2]
+print(f'https://download.pytorch.org/whl/cu{major}{minor}')
 "
 }
 
 echo "== guardrail_eval/setup_pod.sh =="
-python -c "import torch; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())" || true
+python -c "import torch; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available(), '| cuda build:', torch.version.cuda)" || true
 
-echo "-- checking torch/torchvision/torchaudio compatibility --"
+echo "-- checking torch/transformers compatibility --"
 if self_test; then
     echo "already compatible, skipping torch/torchvision/torchaudio reinstall"
 else
-    echo "incompatible (DTensor/torchvision/torchaudio import failed) -- reinstalling"
+    CUDA_INDEX_URL="$(cuda_index_url)"
+    echo "incompatible (DTensor/transformers import failed) -- reinstalling from $CUDA_INDEX_URL (matched to this pod's CUDA build)"
     echo "   pip install --upgrade torch torchvision torchaudio --index-url $CUDA_INDEX_URL"
     pip install --upgrade torch torchvision torchaudio --index-url "$CUDA_INDEX_URL"
 
     echo "-- re-checking after reinstall --"
     if ! self_test; then
-        echo "FATAL: torch/torchvision/torchaudio still incompatible after the" >&2
-        echo "matched-index reinstall. This script only handles the specific" >&2
-        echo "DTensor/ABI-mismatch class seen before -- see PLAN_runpod_audit.md" >&2
-        echo "for manual diagnosis (check torch/torchvision/torchaudio versions" >&2
-        echo "against the pod's actual CUDA driver version)." >&2
+        echo "FATAL: torch/transformers still incompatible after the matched-index" >&2
+        echo "reinstall. See PLAN_runpod_audit.md for manual diagnosis (check" >&2
+        echo "torch/torchvision/torchaudio versions against the pod's actual CUDA" >&2
+        echo "driver version)." >&2
         exit 1
     fi
 fi
+
+echo "-- torchvision/torchaudio (informational only -- not a jlens/guardrail_eval dependency) --"
+python -c "
+import torchvision, torchaudio
+print('torchvision', torchvision.__version__, '| torchaudio', torchaudio.__version__)
+" || echo "   not importable -- fine, guardrail_eval doesn't use them"
 
 echo "-- installing jlens (editable) --"
 pip install -e "$REPO_ROOT"

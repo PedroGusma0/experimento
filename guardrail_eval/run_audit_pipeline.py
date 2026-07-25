@@ -10,8 +10,14 @@ it by interactively probing the J-lens at positions/layers of its own choosing
 LLM-judge (Groq) scores the answer against the expected gabarito.
 
 Only the guardrail is used (no target model), so it loads once -- none of the
-two-phase memory dance of run_attack_pipeline.py is needed. The investigator +
-judge run via API, so this loop is API-bound, not GPU-bound.
+two-phase memory dance of run_attack_pipeline.py is needed. By default the
+investigator + judge run via API (DeepSeek + Groq), so this loop is
+API-bound, not GPU-bound; ``--investigator-backend local``/
+``--judge-backend local`` switch either role to an open-weight model loaded
+locally via ``transformers`` (no vLLM -- see ``local_agent.py`` and
+``PLAN_runpod_audit.md``), in which case guardrail + investigator + judge all
+stay resident together for the whole run (still no phase separation needed,
+since local loading doesn't reserve VRAM the way a vLLM server would).
 
 Runs over one or both attack corpora (``--attack``, mirroring
 run_attack_pipeline.py's baseline / baseline-wrapping split). Writes to a
@@ -73,6 +79,7 @@ def out_paths(attack: str) -> dict[str, Path]:
         "readouts": results_dir / f"audit_readouts_{s}.jsonl",
         "scores": results_dir / f"audit_scores_{s}.jsonl",
         "summary": results_dir / f"audit_summary_{s}.csv",
+        "meta": results_dir / f"audit_run_meta_{s}.json",
     }
 
 
@@ -120,15 +127,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-benign", type=int, default=15)
     parser.add_argument("--guardrail-model", default="Qwen/Qwen3-1.7B")
     parser.add_argument(
+        "--investigator-backend",
+        choices=["api", "local"],
+        default="api",
+        help="'api' (default): DeepSeek via the NVIDIA endpoint, same as "
+        "always -- used by the CPU dry-run. 'local': open-weight model "
+        "loaded locally via transformers, no vLLM -- RunPod only, see "
+        "PLAN_runpod_audit.md ('Modelos abertos locais pro investigador/judge').",
+    )
+    parser.add_argument(
+        "--judge-backend",
+        choices=["api", "local"],
+        default="api",
+        help="'api' (default): Groq, same as always. 'local': open-weight "
+        "model loaded locally via transformers. Independent from "
+        "--investigator-backend -- mixed combinations are supported.",
+    )
+    parser.add_argument(
         "--investigator-model",
-        default="deepseek-ai/deepseek-v4-pro",
-        help="Investigator model (DeepSeek via NVIDIA endpoint).",
+        default=None,
+        help="Investigator model id. Default depends on --investigator-backend "
+        "('deepseek-ai/deepseek-v4-pro' for api, 'Qwen/Qwen2.5-14B-Instruct-AWQ' "
+        "for local -- see local_agent.DEFAULT_LOCAL_INVESTIGATOR_MODEL).",
     )
     parser.add_argument(
         "--judge-model",
-        default="openai/gpt-oss-120b",
-        help="Judge model (Groq). Different provider from the investigator "
-        "on purpose, to reduce self-evaluation bias.",
+        default=None,
+        help="Judge model id. Default depends on --judge-backend "
+        "('openai/gpt-oss-120b' for api, 'meta-llama/Llama-3.1-8B-Instruct' "
+        "for local -- see local_agent.DEFAULT_LOCAL_JUDGE_MODEL). Different "
+        "provider/family from the investigator by default, to reduce "
+        "self-evaluation bias.",
     )
     parser.add_argument("--top-k", type=int, default=25)
     parser.add_argument(
@@ -174,19 +203,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_audit_for_attack(attack: str, gl, args: argparse.Namespace) -> pd.DataFrame:
+def run_audit_for_attack(
+    attack: str,
+    gl,
+    args: argparse.Namespace,
+    *,
+    local_investigator=None,
+    local_judge=None,
+) -> pd.DataFrame:
     """Runs the audit loop for one attack corpus.
+
+    Guardrail + investigator + judge stay resident together the whole loop
+    (no phase separation -- see PLAN_runpod_audit.md for why that's safe now
+    that the local path doesn't use vLLM). ``local_investigator``/
+    ``local_judge`` are ``local_agent.LocalChatModel`` instances, required
+    exactly when ``args.investigator_backend``/``args.judge_backend`` is
+    ``"local"`` (loaded once by ``main()``, reused across attacks).
 
     Returns the *full* accumulated scores for this attack (reloaded from disk
     after writing) -- not just the rows processed in this invocation -- so
     both the per-attack summary and the caller's cross-attack combined
     summary reflect everything on disk, correctly handling ``--resume``.
     """
-    from audit_agent import format_readout_multi, format_token_span, investigate, judge
+    from audit_agent import format_readout_multi, format_token_span
+    from audit_agent import investigate as investigate_api
+    from audit_agent import judge as judge_api
     from ground_truth import ground_truth_for
+
+    if args.investigator_backend == "local":
+        from local_agent import investigate_local
+        assert local_investigator is not None
+    if args.judge_backend == "local":
+        from local_agent import judge_local
+        assert local_judge is not None
 
     subset = select_subset(attack, args.n_malign, args.n_benign)
     paths = out_paths(attack)
+
+    # Provenance: which model/backend produced this invocation's rows --
+    # overwritten each run, reflects the config of the *current* command.
+    with paths["meta"].open("w", encoding="utf-8") as f_meta:
+        json.dump(vars(args), f_meta, ensure_ascii=False, indent=2, default=str)
 
     skip: set[int] = set()
     mode = "w"
@@ -230,6 +287,7 @@ def run_audit_for_attack(attack: str, gl, args: argparse.Namespace) -> pd.DataFr
                         "label_true": row["label"],
                         "guardrail_label_pred": label_pred,
                         "guardrail_raw": guardrail_raw,
+                        "guardrail_model": args.guardrail_model,
                         "jlens": {str(k): v for k, v in readout.items()},
                     },
                     ensure_ascii=False,
@@ -265,15 +323,29 @@ def run_audit_for_attack(attack: str, gl, args: argparse.Namespace) -> pd.DataFr
 
             claims = ground_truth_for(row["label"], label_pred)
             for claim, expected in claims:
-                inv = investigate(
-                    transcript,
-                    claim.text,
-                    readout_fn=readout_fn,
-                    token_span_text=token_span_text,
-                    model=args.investigator_model,
-                    max_tool_calls=args.max_tool_calls,
-                )
-                jud = judge(claim.text, inv, expected, model=args.judge_model)
+                if args.investigator_backend == "local":
+                    inv = investigate_local(
+                        transcript,
+                        claim.text,
+                        readout_fn=readout_fn,
+                        token_span_text=token_span_text,
+                        model=local_investigator,
+                        max_tool_calls=args.max_tool_calls,
+                    )
+                else:
+                    inv = investigate_api(
+                        transcript,
+                        claim.text,
+                        readout_fn=readout_fn,
+                        token_span_text=token_span_text,
+                        model=args.investigator_model,
+                        max_tool_calls=args.max_tool_calls,
+                    )
+
+                if args.judge_backend == "local":
+                    jud = judge_local(claim.text, inv, expected, model=local_judge)
+                else:
+                    jud = judge_api(claim.text, inv, expected, model=args.judge_model)
 
                 if args.verbose:
                     print(
@@ -296,6 +368,10 @@ def run_audit_for_attack(attack: str, gl, args: argparse.Namespace) -> pd.DataFr
                     "investigator_evidence": inv["evidence"],
                     "tool_calls": inv.get("tool_calls", 0),
                     "fallback_used": inv.get("fallback_used", False),
+                    "investigator_model": args.investigator_model,
+                    "investigator_backend": args.investigator_backend,
+                    "judge_model": args.judge_model,
+                    "judge_backend": args.judge_backend,
                     "correctness": jud["correctness"],
                     "evidence_quality": jud["evidence_quality"],
                     "score": jud["score"],
@@ -345,6 +421,29 @@ def main() -> None:
     # torch to be importable.
     from jlens_readout import GuardrailLens
 
+    needs_local = args.investigator_backend == "local" or args.judge_backend == "local"
+    if needs_local:
+        # local_agent imports transformers -- only pay for that when actually
+        # needed (the default api/api path never touches it).
+        from local_agent import (
+            DEFAULT_LOCAL_INVESTIGATOR_MODEL,
+            DEFAULT_LOCAL_JUDGE_MODEL,
+            LocalChatModel,
+        )
+
+    if args.investigator_model is None:
+        args.investigator_model = (
+            DEFAULT_LOCAL_INVESTIGATOR_MODEL
+            if args.investigator_backend == "local"
+            else "deepseek-ai/deepseek-v4-pro"
+        )
+    if args.judge_model is None:
+        args.judge_model = (
+            DEFAULT_LOCAL_JUDGE_MODEL
+            if args.judge_backend == "local"
+            else "openai/gpt-oss-120b"
+        )
+
     attacks = ATTACKS if args.attack == "both" else [args.attack]
     dtype = getattr(torch, args.dtype)
 
@@ -355,7 +454,25 @@ def main() -> None:
     gl = GuardrailLens(args.guardrail_model, dtype=dtype, device=args.device)
     print(f"  {gl.model}\n  {gl.lens}")
 
-    all_scores = [run_audit_for_attack(attack, gl, args) for attack in attacks]
+    # Guardrail + investigator + judge stay resident together the whole run
+    # (no phase separation -- see PLAN_runpod_audit.md). Loaded once, reused
+    # across attacks.
+    local_investigator = local_judge = None
+    if args.investigator_backend == "local":
+        print(f"loading local investigator {args.investigator_model} (device={args.device}) ...")
+        local_investigator = LocalChatModel.load(
+            args.investigator_model, dtype=dtype, device=args.device
+        )
+    if args.judge_backend == "local":
+        print(f"loading local judge {args.judge_model} (device={args.device}) ...")
+        local_judge = LocalChatModel.load(args.judge_model, dtype=dtype, device=args.device)
+
+    all_scores = [
+        run_audit_for_attack(
+            attack, gl, args, local_investigator=local_investigator, local_judge=local_judge
+        )
+        for attack in attacks
+    ]
 
     if len(attacks) > 1:
         combined = pd.concat([s for s in all_scores if not s.empty], ignore_index=True)

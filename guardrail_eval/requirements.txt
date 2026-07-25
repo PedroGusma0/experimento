@@ -7,6 +7,18 @@ tqdm
 openai
 groq
 python-dotenv
+# XAI report (make_report.py): static charts + PDF assembly, no external
+# binary (e.g. pandoc) required.
+matplotlib
+reportlab
+# local_agent.py (--investigator-backend/--judge-backend local, RunPod only):
+# investigator + judge as open-weight models loaded via `transformers`
+# directly, no vLLM. Not installed here on purpose -- the default
+# investigator (Qwen2.5-14B-Instruct-AWQ) needs `autoawq`, a CUDA-only
+# package that would break `pip install -r requirements.txt` on this
+# CPU/Windows dev venv. Install it on the pod only, when using the local
+# backend:
+#   pip install autoawq
 # jlens (the interpretability package at the repo root) is used by
 # run_guardrail_jlens.py / jlens_readout.py. Install it editable into this venv:
 #   .venv\Scripts\python -m pip install -e ..
