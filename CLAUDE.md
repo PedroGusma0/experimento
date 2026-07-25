@@ -13,6 +13,19 @@ model's own unembedding. Companion code for the paper *Verbalizable
 Representations Form a Global Workspace in Language Models*. Not accepting
 contributions.
 
+**Before doing any conceptual/research task involving the J-lens or the
+paper's findings, read [`PAPER_SUMMARY.md`](PAPER_SUMMARY.md) instead of
+`artigo_principal.pdf`.** It's a full section-by-section summary (methods,
+formula, pseudocode, every experimental result, terminology, limitations,
+and a table mapping paper concepts to exact code locations) distilled from
+the 117-page PDF, which is too large to re-read on every task. Only open the
+PDF directly for a verbatim quote, a figure, or an appendix subsection the
+summary explicitly flags as uncovered.
+
+This repo also hosts an applied experiment, `guardrail_eval/`, that is not
+part of the `jlens` library or the paper — see
+[`guardrail_eval/ (experiment)`](#guardrail_eval-experiment) below.
+
 ## Commands
 
 Install (editable, with dev deps):
@@ -136,3 +149,36 @@ and is documented there, not in the JSON itself.
 - `SKIP_FIRST_N_POSITIONS` (fitting.py) excludes early attention-sink
   positions from the Jacobian average — don't casually change this default,
   it's a documented modeling choice, not a tunable.
+
+## `guardrail_eval/` (experiment)
+
+`guardrail_eval/` is a research **experiment**, not part of the `jlens`
+library or the paper it accompanies — it only ever imports `jlens` as a
+library (`pip install -e ..`); nothing under `jlens/` is modified for it.
+
+It exists to answer an open question in a separate, larger project (the
+"main project": an RL-based attacker hammering a guardrail in front of a
+target LLM, where the guardrail is an autoencoder — `Ataque (RL Hammer) →
+Guardrail (Autoencoder) → XAI (?) → LLM Alvo`). That project has no answer
+yet for what XAI method should explain the guardrail's decisions. Since the
+Jacobian lens reads out the residual stream of a decoder transformer, it
+can't be applied directly to an autoencoder-based guardrail — so this
+experiment inserts an additional, LLM-based guardrail (Qwen3-1.7B) purely
+so the J-lens has something to read, then tests whether J-lens readouts are
+a viable, *automatable* XAI method by running them through an automated
+audit loop (an investigator agent that reads the lens output, scored by an
+LLM-judge — modeled on the paper's Appendix A.22 auditor). The goal is to
+validate this approach here, at small scale, before committing to it for
+the main project's `XAI (?)` gap.
+
+See [`markdowns-de-referencia/ARCHITECTURE.md`](markdowns-de-referencia/ARCHITECTURE.md) for
+the full pipeline (phases 0–3: baseline, guardrail + J-lens, attack + target,
+automated auditor),
+[`guardrail_eval/PLAN_runpod_audit.md`](guardrail_eval/PLAN_runpod_audit.md)
+for the GPU execution plan, and
+[`markdowns-de-referencia/VISUALIZATION.md`](markdowns-de-referencia/VISUALIZATION.md)
+for how `jlens.vis`'s position × layer slice pages apply to this experiment
+(`guardrail_eval/make_slices.py`) — don't duplicate that detail here. Status:
+phases 0–2 are validated via local CPU smoke tests; phase 3 (the automated
+auditor) is implemented but not yet run at scale (pending RunPod GPU
+execution).

@@ -266,6 +266,8 @@ guardrail_eval/
 ├── audit_agent.py            # Phase 3: investigator (DeepSeek) + judge (Groq gpt-oss-120b) (format_readout/investigate/judge)
 ├── run_audit_pipeline.py     # Phase 3: auditor driver (guardrail + lens + investigator + judge)
 ├── setup_pod.sh              # Phase 3: idempotent pod setup (matched-index torch/torchvision/torchaudio fix + installs)
+├── make_slices.py            # jlens.vis.compute_slice pages for selected rows (see VISUALIZATION.md)
+├── make_report.py            # static XAI report (MD + PDF) over an audit run (see VISUALIZATION.md)
 ├── data/
 │   ├── harmbench_labeled.csv          # 200 malign seeds
 │   ├── jailbreakbench_benign_en.csv   # 30 benign seeds (source data)
@@ -308,10 +310,12 @@ guardrail_eval/
 
 - No blocking/gating logic — the guardrail's verdict is recorded, never
   enforced.
-- No position sweep for the J-lens — reads only the single decision
-  position (`-1`); localizing *which token* of the prompt triggered
-  recognition (e.g. via `jlens.vis.compute_slice` or a position list) is a
-  natural next step but was deferred for cost reasons.
+- No dense position sweep as part of the audit loop itself — the
+  investigator's `readout_multi` probing is sparse and agent-chosen (see
+  Phase 3 above). `make_slices.py`/`make_report.py` (see
+  `VISUALIZATION.md`) fill this in for a hand-picked subset of rows via
+  `jlens.vis.compute_slice`, but that stays a separate, selective step —
+  running it over a full corpus is still deferred for cost reasons.
 - No causal validation of the lens (ablation / lens-coordinate swap) —
   everything so far is read-only interpretability, not yet a causal claim
   that the surfaced concepts *drive* the verdict.
