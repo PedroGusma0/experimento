@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+import traceback
 from collections.abc import Callable
 
 import torch
@@ -48,9 +49,11 @@ from audit_agent import (
 #: Default local models -- different families, preserving the cross-provider
 #: bias-reduction rationale from the API path (see PLAN_runpod_audit.md).
 #: Starting guesses, not tuned -- calibrate on the first pod run.
-#: The investigator default is AWQ-quantized (needs `pip install autoawq`,
-#: CUDA-only) so it fits alongside the guardrail + judge in 48GB VRAM; see
-#: the VRAM budget in PLAN_runpod_audit.md.
+#: The investigator default is AWQ-quantized (needs an AWQ backend package,
+#: CUDA-only -- `pip install gptqmodel` on newer transformers, `autoawq` on
+#: older ones; transformers' own error message says which one it wants) so
+#: it fits alongside the guardrail + judge in 48GB VRAM; see the VRAM budget
+#: in PLAN_runpod_audit.md.
 DEFAULT_LOCAL_INVESTIGATOR_MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
 DEFAULT_LOCAL_JUDGE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
@@ -195,6 +198,7 @@ def investigate_local(
                     }
                 )
     except Exception as exc:  # noqa: BLE001 - record, don't crash the run
+        traceback.print_exc()  # swallowed as `error` below -- print it too, or it's lost
         return {
             "verdict": "nao", "evidence": "", "raw": "", "error": str(exc),
             "tool_calls": tool_calls_used, "fallback_used": False,
@@ -210,12 +214,17 @@ def investigate_local(
             ),
         }
     )
+    raw = ""
     try:
         raw = model.chat(messages, tools=None, temperature=temperature)
         parsed = _InvestigatorOut.model_validate_json(_extract_json(raw))
     except Exception as exc:  # noqa: BLE001 - record, don't crash the run
+        traceback.print_exc()
+        # `raw` is kept (even on a parse failure) so the actual model output
+        # is visible in the JSONL, not just the exception message.
         return {
-            "verdict": "nao", "evidence": "", "raw": "", "error": str(exc),
+            "verdict": "nao", "evidence": "", "raw": raw,
+            "error": f"{exc} | raw={raw[:300]!r}",
             "tool_calls": tool_calls_used, "fallback_used": False,
         }
     verdict = parsed.verdict.strip().lower()
@@ -255,13 +264,16 @@ def judge_local(
         {"role": "system", "content": _JUDGE_INSTRUCTION},
         {"role": "user", "content": contents},
     ]
+    raw = ""
     try:
         raw = model.chat(messages, tools=None, temperature=temperature)
         parsed = _JudgeOut.model_validate_json(_extract_json(raw))
     except Exception as exc:  # noqa: BLE001 - record, don't crash the run
+        traceback.print_exc()
         return {
             "correctness": 0, "evidence_quality": 0, "score": 0.0,
-            "justification": "", "raw": "", "error": str(exc),
+            "justification": "", "raw": raw,
+            "error": f"{exc} | raw={raw[:300]!r}",
         }
     correctness = max(0, min(10, parsed.correctness))
     evidence_quality = max(0, min(10, parsed.evidence_quality))

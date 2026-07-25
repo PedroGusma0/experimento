@@ -368,6 +368,7 @@ def run_audit_for_attack(
                     "investigator_evidence": inv["evidence"],
                     "tool_calls": inv.get("tool_calls", 0),
                     "fallback_used": inv.get("fallback_used", False),
+                    "investigator_error": inv.get("error", ""),
                     "investigator_model": args.investigator_model,
                     "investigator_backend": args.investigator_backend,
                     "judge_model": args.judge_model,
@@ -376,6 +377,7 @@ def run_audit_for_attack(
                     "evidence_quality": jud["evidence_quality"],
                     "score": jud["score"],
                     "justification": jud["justification"],
+                    "judge_error": jud.get("error", ""),
                 }
                 n_new += 1
                 f_score.write(json.dumps(score_row, ensure_ascii=False) + "\n")

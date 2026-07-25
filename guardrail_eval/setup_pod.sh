@@ -27,13 +27,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$HERE")"
 
-# The real gate: transformers (what jlens needs) importing cleanly, including
-# the specific DTensor path that broke on torch 2.4.0.
+# The real gate: DTensor is what actually broke on torch 2.4.0, and it's
+# part of torch itself (no dependency on transformers being installed yet --
+# that only happens further down, via `pip install -e`/`pip install -r
+# requirements.txt`). Testing `import transformers` here would always fail
+# on a fresh pod regardless of torch's health, since it isn't installed yet
+# at this point in the script.
 self_test() {
     python -c "
 from torch.distributed.tensor import DTensor
-import transformers
-print('torch/transformers OK')
+print('torch OK (DTensor importable)')
 "
 }
 
@@ -53,21 +56,21 @@ print(f'https://download.pytorch.org/whl/cu{major}{minor}')
 echo "== guardrail_eval/setup_pod.sh =="
 python -c "import torch; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available(), '| cuda build:', torch.version.cuda)" || true
 
-echo "-- checking torch/transformers compatibility --"
+echo "-- checking torch compatibility (DTensor) --"
 if self_test; then
     echo "already compatible, skipping torch/torchvision/torchaudio reinstall"
 else
     CUDA_INDEX_URL="$(cuda_index_url)"
-    echo "incompatible (DTensor/transformers import failed) -- reinstalling from $CUDA_INDEX_URL (matched to this pod's CUDA build)"
+    echo "incompatible (DTensor import failed) -- reinstalling from $CUDA_INDEX_URL (matched to this pod's CUDA build)"
     echo "   pip install --upgrade torch torchvision torchaudio --index-url $CUDA_INDEX_URL"
     pip install --upgrade torch torchvision torchaudio --index-url "$CUDA_INDEX_URL"
 
     echo "-- re-checking after reinstall --"
     if ! self_test; then
-        echo "FATAL: torch/transformers still incompatible after the matched-index" >&2
-        echo "reinstall. See PLAN_runpod_audit.md for manual diagnosis (check" >&2
-        echo "torch/torchvision/torchaudio versions against the pod's actual CUDA" >&2
-        echo "driver version)." >&2
+        echo "FATAL: torch still incompatible (DTensor still not importable) after" >&2
+        echo "the matched-index reinstall. See PLAN_runpod_audit.md for manual" >&2
+        echo "diagnosis (check torch/torchvision/torchaudio versions against the" >&2
+        echo "pod's actual CUDA driver version)." >&2
         exit 1
     fi
 fi
@@ -85,6 +88,11 @@ echo "-- installing guardrail_eval requirements --"
 pip install -r "$HERE/requirements.txt"
 
 echo "-- final sanity check --"
-python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+python -c "
+import torch, transformers, jlens
+print('CUDA available:', torch.cuda.is_available())
+print('transformers', transformers.__version__)
+print('jlens', jlens.__file__)
+"
 
 echo "== setup complete =="
