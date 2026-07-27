@@ -94,16 +94,24 @@ class LocalChatModel:
     ) -> str:
         """Render `messages` (+ optional OpenAI-style `tools`) via the
         model's chat template and greedily generate the reply text."""
-        input_ids = self.tok.apply_chat_template(
+        # return_dict=True forces a BatchEncoding (input_ids/attention_mask)
+        # instead of a bare tensor -- some transformers versions return a
+        # BatchEncoding from apply_chat_template(return_tensors="pt") even
+        # without return_dict, which broke generate() when passed positionally
+        # (it expects either a plain tensor or **kwargs, not a dict-like object
+        # as the positional `inputs` arg).
+        encoded = self.tok.apply_chat_template(
             messages,
             tools=tools,
             add_generation_prompt=True,
             return_tensors="pt",
+            return_dict=True,
         ).to(self.hf.device)
+        input_ids = encoded["input_ids"]
         do_sample = temperature > 0
         with torch.no_grad():
             output_ids = self.hf.generate(
-                input_ids,
+                **encoded,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
@@ -168,8 +176,15 @@ def investigate_local(
     ]
 
     tool_calls_used = 0
+    # Hard cap on chat() rounds, independent of tool_calls_used: without
+    # grammar-constrained decoding, nothing stops the model from continuing
+    # to emit <tool_call> text out of habit even after tools=None and being
+    # told the limit is reached -- `if not calls: break` alone doesn't
+    # guarantee termination in that degenerate case. A few rounds of slack
+    # beyond max_tool_calls give it a chance to wind down normally first.
+    max_rounds = max_tool_calls + 3
     try:
-        while True:
+        for _round in range(max_rounds):
             allow_tools = tool_calls_used < max_tool_calls
             text = model.chat(
                 messages,

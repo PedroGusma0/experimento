@@ -226,6 +226,48 @@ aggregate + investigator accuracy); with `--attack both`, an additional
 `audit_summary_combined.csv` aggregates across both. Dry-run:
 `python run_audit_pipeline.py --device cpu --attack baseline --n-malign 2 --n-benign 2`.
 
+### Causal interventions — steer / ablate / swap primitives
+
+The pipeline above is **read-only** interpretability: it surfaces which
+concepts drive the guardrail's verdict but never proves they *cause* it. The
+paper's two causal *writing* primitives (steering/ablation and the
+lens-coordinate swap of Figure 4C; see `PAPER_SUMMARY.md`, "The J-lens's
+read/write primitives", §2.5) are described but **not** implemented in
+`jlens/lens.py`. Since `guardrail_eval/` must not modify `jlens/`, they are
+built here, on the three ingredients `jlens` already exposes: `J_l`
+(`JacobianLens.jacobians[layer]`), `W_U` (the model's `lm_head.weight`), and a
+*write-capable* forward hook (which `jlens.hooks.ActivationRecorder`
+deliberately is not — its hook only reads).
+
+**`interventions.py`** — model-agnostic, operates on residual-stream tensors:
+- `lens_vectors(lens, W_U, layer)` / `lens_vector(...)` — the J-lens vectors
+  `v_t` = rows of `W_U · J_l` (drops the final `norm`, matching §2.1).
+- `steer(h, v, α)` = `h + α·v`; `ablate(h, v)` projects out the component of
+  `h` along `v`; `ablate_span(h, V)` zeroes the projection onto `k` vectors at
+  once (the J-space ablation of §3.5.2, `k=10` across a layer band).
+- `swap(h, v_s, v_t, α)` — the Figure 4C formula: `V=[v_s v_t]`,
+  `c=V⁺h`, `h_patched = h + α·V(σ(c)−c)`, leaving `span{v_s,v_t}`'s orthogonal
+  complement untouched.
+- `InterventionHook(blocks, {layer: edit_fn}, positions=...)` — a context
+  manager that *writes* an edit into the residual stream during the forward
+  pass and cleanly removes itself on exit. Enter it before an
+  `ActivationRecorder` on the same blocks if the recorder must see the edit.
+
+**`tests/test_interventions.py`** — 10 **invariant** tests against
+`jlens`'s `TinyDecoder` (whose exactly-linear blocks make `J_l` exact, so the
+algebra is clean). They verify the primitives are *mechanically correct and
+correctly plumbed*: steer moves by exactly `α·v`; ablate zeroes the
+projection and is idempotent; swap exchanges the two lens coordinates,
+preserves the orthogonal complement, and is an involution at `α=1`; the hook
+edits only the requested position, propagates downstream, and is removed on
+exit. **These prove nothing semantic or causal** — `TinyDecoder` has untrained
+weights and no interpretable vocabulary; "swap Soccer→Rugby flips the output"
+can only be shown on the trained Qwen3-1.7B guardrail. This test de-risks the
+*engineering* so that a null result on Qwen3 later reads as a finding, not a
+bug. `guardrail_eval/.venv` has no pytest, so the file is a self-contained
+script: `guardrail_eval/.venv/Scripts/python.exe guardrail_eval/tests/test_interventions.py`
+(also pytest-collectable where available).
+
 ## Data flow (Phase 2, current state)
 
 ```
@@ -265,6 +307,9 @@ guardrail_eval/
 ├── ground_truth.py           # Phase 3: Strategy-A claims (label x verdict -> expected answer)
 ├── audit_agent.py            # Phase 3: investigator (DeepSeek) + judge (Groq gpt-oss-120b) (format_readout/investigate/judge)
 ├── run_audit_pipeline.py     # Phase 3: auditor driver (guardrail + lens + investigator + judge)
+├── interventions.py          # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap + InterventionHook (write-capable)
+├── tests/
+│   └── test_interventions.py # 10 invariant tests vs TinyDecoder (standalone script; no pytest in venv)
 ├── setup_pod.sh              # Phase 3: idempotent pod setup (matched-index torch/torchvision/torchaudio fix + installs)
 ├── make_slices.py            # jlens.vis.compute_slice pages for selected rows (see VISUALIZATION.md)
 ├── make_report.py            # static XAI report (MD + PDF) over an audit run (see VISUALIZATION.md)
@@ -305,6 +350,9 @@ guardrail_eval/
     into completing the persona's roleplay text instead of emitting a
     clean verdict. This is a real signal about wrapping attacks degrading
     guardrail output reliability, not a pipeline bug.
+- Interventions: 10/10 invariant tests pass for `interventions.py`
+  (steer/ablate/swap + write hook) against `TinyDecoder` — mechanical
+  correctness only, no semantic/causal validation yet (needs Qwen3).
 
 ## Not yet built (explicitly out of scope so far)
 
@@ -316,9 +364,13 @@ guardrail_eval/
   `VISUALIZATION.md`) fill this in for a hand-picked subset of rows via
   `jlens.vis.compute_slice`, but that stays a separate, selective step —
   running it over a full corpus is still deferred for cost reasons.
-- No causal validation of the lens (ablation / lens-coordinate swap) —
-  everything so far is read-only interpretability, not yet a causal claim
-  that the surfaced concepts *drive* the verdict.
+- No causal validation of the lens *on the guardrail*. The mechanical
+  primitives now exist (`interventions.py`, invariant-tested — see "Causal
+  interventions" above), but they have not been *run on Qwen3* to show that
+  ablating/swapping the surfaced concepts actually changes the guardrail's
+  verdict. Everything scored so far is read-only interpretability; the causal
+  claim (and the auditor's "Strategy B" ground truth: ablation-KL + swap
+  success, §A.6) is still pending.
 - No LLM-judge / attack-success-rate scoring of target outputs — the
   target results are raw completions only, not yet graded.
 - Full-corpus runs (all 230 seeds × 2 attacks) — everything to date is a

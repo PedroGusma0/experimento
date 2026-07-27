@@ -182,3 +182,9 @@ for how `jlens.vis`'s position × layer slice pages apply to this experiment
 phases 0–2 are validated via local CPU smoke tests; phase 3 (the automated
 auditor) is implemented but not yet run at scale (pending RunPod GPU
 execution).
+
+**[`markdowns-de-referencia/ARCHITECTURE.md`](markdowns-de-referencia/ARCHITECTURE.md)
+is the canonical record of the `guardrail_eval/` architecture and its tests.**
+Any change to the `guardrail_eval/` architecture or its test suite must be
+documented there — but **always ask the user first before writing to
+`ARCHITECTURE.md`**; do not update it unprompted.

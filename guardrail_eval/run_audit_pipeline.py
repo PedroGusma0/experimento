@@ -23,7 +23,10 @@ Runs over one or both attack corpora (``--attack``, mirroring
 run_attack_pipeline.py's baseline / baseline-wrapping split). Writes to a
 dedicated results_audit/ folder (separate from run_attack_pipeline's
 results/), one set of files per attack:
-  results_audit/audit_readouts_<attack>.jsonl  (one record per prompt)
+  results_audit/audit_readouts_<attack>.jsonl  (one record per investigator
+      readout attempt -- positions/layers/tokens it actually probed; a single
+      zero-probe row when a claim triggered no query or the verdict was
+      "unknown", so every processed prompt still has >=1 row)
   results_audit/audit_scores_<attack>.jsonl    (one record per (prompt, claim))
   results_audit/audit_summary_<attack>.csv     (per-claim aggregate)
 With ``--attack both``, an additional results_audit/audit_summary_combined.csv
@@ -268,33 +271,55 @@ def run_audit_for_attack(
             label_pred, guardrail_raw = gl.classify(
                 guardrail_prompt, max_new_tokens=args.guardrail_max_new_tokens
             )
-            # Anchor readout at the decision position -- the investigator no
-            # longer reads this directly; it probes readout_multi()
-            # interactively via the tool (below). Kept for continuity of
-            # audit_readouts_<attack>.jsonl and as the --resume checkpoint.
-            readout = gl.readout(
-                guardrail_prompt, layers=args.layers, top_k=args.top_k
-            )
+            # Token count of the guardrail prompt -- used to normalize the
+            # investigator's (possibly negative) probe positions to absolute
+            # indices before logging, so audit_readouts never mixes -1 with
+            # absolute positions like 156. encode() is tokenization only (no
+            # forward pass); shape is [1, seq_len].
+            n_tokens = int(gl.model.encode(guardrail_prompt).shape[1])
 
-            f_read.write(
-                json.dumps(
-                    {
-                        "attack": attack,
-                        "pool_index": pool_index,
-                        "seed": row["seed"],
-                        "prompt": row["prompt"],
-                        "category": row["category"],
-                        "label_true": row["label"],
-                        "guardrail_label_pred": label_pred,
-                        "guardrail_raw": guardrail_raw,
-                        "guardrail_model": args.guardrail_model,
-                        "jlens": {str(k): v for k, v in readout.items()},
-                    },
-                    ensure_ascii=False,
+            def _abs_pos(p: int, *, _n: int = n_tokens) -> int:
+                return p + _n if p < 0 else p
+
+            # Identity fields repeated on every readout row of this prompt, so
+            # any single row is self-describing and rows can be deduped by
+            # pool_index by downstream consumers.
+            readout_identity = {
+                "attack": attack,
+                "pool_index": pool_index,
+                "seed": row["seed"],
+                "prompt": row["prompt"],
+                "category": row["category"],
+                "label_true": row["label"],
+                "guardrail_label_pred": label_pred,
+                "guardrail_raw": guardrail_raw,
+                "guardrail_model": args.guardrail_model,
+            }
+
+            def _write_readout_row(
+                claim_id: str | None,
+                attempt: int | None,
+                positions: list[int],
+                layers: list[int],
+                readout: dict | None,
+                *,
+                _identity: dict = readout_identity,
+            ) -> None:
+                f_read.write(
+                    json.dumps(
+                        {
+                            **_identity,
+                            "claim_id": claim_id,
+                            "attempt": attempt,
+                            "positions": positions,
+                            "layers": layers,
+                            "readout": readout,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            f_read.flush()  # survive a mid-run interruption for --resume
+                f_read.flush()  # survive a mid-run interruption for --resume
 
             transcript = (
                 f"O guardrail recebeu esta mensagem para classificar:\n"
@@ -305,24 +330,51 @@ def run_audit_for_attack(
                 gl.token_span(guardrail_prompt, last_n=args.token_span_last_n)
             )
 
-            def readout_fn(
-                positions: list[int],
-                layers: list[int] | None,
-                *,
-                _prompt: str = guardrail_prompt,
-            ) -> str:
-                """Bound to this row's guardrail_prompt; called by the
-                investigator's tool loop (see audit_agent.investigate)."""
-                multi = gl.readout_multi(
-                    _prompt,
-                    positions=positions,
-                    layers=layers or args.layers,
-                    top_k=args.top_k,
-                )
-                return format_readout_multi(multi)
-
             claims = ground_truth_for(row["label"], label_pred)
+            if not claims:
+                # "unknown" verdict -> no claim to audit. Still record one
+                # zero-probe row so every processed prompt appears in
+                # audit_readouts (coverage for confusion stats + --resume).
+                _write_readout_row(None, None, [], [], None)
+
             for claim, expected in claims:
+                # Fresh per-claim log; readout_fn appends one entry per real
+                # get_jlens_readout call the investigator makes (see below).
+                probe_log: list[dict] = []
+
+                def readout_fn(
+                    positions: list[int],
+                    layers: list[int] | None,
+                    *,
+                    _prompt: str = guardrail_prompt,
+                    _log: list[dict] = probe_log,
+                ) -> str:
+                    """Bound to this row's guardrail_prompt + this claim's
+                    probe_log; called by the investigator's tool loop (see
+                    audit_agent.investigate). Records the structured readout of
+                    each probe before returning the formatted text."""
+                    resolved_layers = layers or args.layers
+                    multi = gl.readout_multi(
+                        _prompt,
+                        positions=positions,
+                        layers=resolved_layers,
+                        top_k=args.top_k,
+                    )
+                    _log.append(
+                        {
+                            "positions": [_abs_pos(int(p)) for p in positions],
+                            "layers": [int(x) for x in resolved_layers],
+                            "readout": {
+                                str(layer): {
+                                    str(_abs_pos(int(pos))): entries
+                                    for pos, entries in per_pos.items()
+                                }
+                                for layer, per_pos in multi.items()
+                            },
+                        }
+                    )
+                    return format_readout_multi(multi)
+
                 if args.investigator_backend == "local":
                     inv = investigate_local(
                         transcript,
@@ -341,6 +393,23 @@ def run_audit_for_attack(
                         model=args.investigator_model,
                         max_tool_calls=args.max_tool_calls,
                     )
+
+                # Persist what the investigator actually probed: one row per
+                # get_jlens_readout call (attempt index in order), or a single
+                # zero-probe row if it never queried the tool (e.g. errored
+                # before any call, or a fallback that failed). Written before
+                # the score row so the probes survive even if the judge fails.
+                if probe_log:
+                    for i, probe in enumerate(probe_log):
+                        _write_readout_row(
+                            claim.id,
+                            i,
+                            probe["positions"],
+                            probe["layers"],
+                            probe["readout"],
+                        )
+                else:
+                    _write_readout_row(claim.id, None, [], [], None)
 
                 if args.judge_backend == "local":
                     jud = judge_local(claim.text, inv, expected, model=local_judge)

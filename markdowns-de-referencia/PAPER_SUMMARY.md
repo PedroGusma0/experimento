@@ -90,24 +90,107 @@ full representation.
 - Both alternatives are implemented for comparison purposes only in the
   paper, not in this repo; `jlens` implements only the J-lens.
 
-### Two intervention primitives (both causal, both in `jlens`/possible to build on it)
+### The J-lens's read/write primitives (verbatim from §2.5, "Technical details of J-lens use cases", p.9)
 
-1. **Steering / ablation**: `h <- h + α·v_t` along a single J-lens vector
-   (or subtract/project out `v_t` to suppress a concept). Used to inject
-   concepts (introspection experiments) or ablate the top-k active J-space
-   directions (capability/ablation studies, §3.5.2–3.5.3).
-2. **Lens-coordinate swap**: exchange one concept for another while leaving
-   the rest of the activation fixed. Given source token `s`, target token
-   `t`, form `V = [v_s, v_t]`, read coordinates `c = V^+ h` (pseudoinverse),
-   and set `h_patched = h + V(σ(c) - c)` where `σ` swaps the two coordinates
-   (optionally scaled by `α`). This is the main causal-intervention tool
-   used throughout the paper's experiments (§2.1, Figure 4C) and underlies
-   the "swap" convention documented in `data/experiments/README.md` /
-   `data/evaluations/README.md`.
+The paper uses the lens two ways — **reading** concepts out of an activation
+and **writing** concepts into/out of it. **The canonical formulas live in
+§2.5, not the appendix**; §A.13 is only per-trial *results* (see below). All
+of these use the **J-lens vectors** `v_t` = rows of `W_U · J_l` — one
+residual-space direction per vocab token per layer (§2.1). Important
+caveat, confirmed verbatim on p.9: the readout applies `norm(J_l·h)`, so
+`v_t` (a bare row of `W_U·J_l`) drops the final normalization — the
+pre-softmax logit equals the inner product `⟨v_t, h_l⟩` only "approximately,
+up to a data-dependent normalization factor."
 
-Neither primitive is implemented in `jlens/lens.py` yet (the repo currently
-ships fitting + reading, i.e. `fit`/`apply`/`transport`); they'd be a natural
-extension if the "future adaptation" mentioned by the user builds on this.
+**Reading** (three forms):
+
+1. **Full readout** — `lens(h_l) = softmax(W_U·norm(J_l·h_l))`, the ranked
+   vocab list. This is `JacobianLens.apply` (implemented).
+2. **Per-token probe** — the score / cosine of `h_l` against a single chosen
+   `v_t` (i.e. `⟨v_t, h_l⟩`), to test whether one concept is present above a
+   threshold without ranking the whole vocab. `v_t = J_l.T · W_U[t]` = row
+   `t` of `W_U·J_l`. **Not a method in `jlens` yet**, but trivially derivable
+   from `lens.jacobians[l]` + the model's `W_U`.
+3. **Sparse decomposition** — solve for a sparse nonnegative combination of
+   `k` J-lens vectors reconstructing `h_l` via **gradient pursuit** (not
+   top-k by inner product; gives the occupancy / fraction-of-variance numbers
+   of §4.2). Also **not in `jlens`**.
+
+**Writing** (the two causal primitives, both absent from `jlens/lens.py`):
+
+1. **Steering / ablation.** Steer: `h ← h + α·v_t` at chosen layers/positions
+   (positive `α` injects a concept — introspection experiments). Ablate:
+   negative `α`, or project the component of `h` along `v_t` out entirely.
+   The load-bearing form is the paper's **J-space ablation** (§3.5.2–3.5.3):
+   at each position, across a **band of layers**, find the `k = 10` most
+   strongly active J-lens vectors and zero the residual's projection onto
+   each, then continue the forward pass. Two methodological guardrails: (a)
+   **skip any token in the clean forward pass's top-10 output**, so you ablate
+   internal reasoning rather than the intended report; (b) validate against a
+   **matched-norm random-direction control**. "Light / medium / heavy"
+   ablation = how wide the layer band is; the experiential-report ablation
+   used `k = 10` over **L38–54** (early third of the workspace band), and
+   larger `k` or later layers break coherence.
+2. **Lens-coordinate swap** (Figure 4C) — the paper's main causal tool.
+   Source token `s`, target `t`: form `V = [v_s  v_t]`, read lens coordinates
+   `c = V⁺·h` (`V⁺` = pseudoinverse of `V`), set `h_patched = h + V(σ(c) − c)`
+   where `σ` swaps the two entries of `c` (optional scale `α`). Everything
+   orthogonal to `span{v_s, v_t}` is untouched. Concretely (§3.1): subtract
+   the projection onto `v_s`, add an equal-magnitude projection onto `v_t`, at
+   **all token positions** across the workspace band. Default `α = 1`; when
+   `α = 1` moves the activation in the right direction but not far enough,
+   `α = 2` often completes the flip (§A.13). Sometimes run as a **clamped**
+   swap (hold the swapped coordinates fixed at every layer/position) to block
+   the concept re-entering the J-space (§3.1, §3.5.1).
+
+**Where you intervene matters — layer-dependence (§A.14).** Early workspace
+layers (**L38–54**) and late workspace layers (**L75–92**) do different jobs:
+ablating a concept's `v_t` *late* just makes the model less likely to *say*
+it (late layers ≈ the intention to output the word); ablating it *early*
+leaves *naming* intact but breaks the model's ability to *avoid* naming it
+(early layers carry active suppression). So an ablation/swap's effect depends
+on the chosen layer band, not only on the vector.
+
+**How the paper *measures* whether a direction is causal (§A.6).** Two
+metrics, useful as ground-truth signal for any downstream evaluation: (i)
+**ablation effect** = KL divergence induced on the output by projecting the
+token's lens vector to zero at the readout position; (ii) **swap success
+rate** = whether the top-1 output flips to the swapped-in concept at `α = 1`.
+J-lens directions produce ~2× the ablation KL of logit-/tuned-lens directions
+and flip the output more often, across all three model scales.
+
+None of these primitives are implemented in `jlens/lens.py` (the repo ships
+fitting + reading, i.e. `fit`/`apply`/`transport`). The raw materials to
+build them exist and are exposed: `J_l` from `lens.jacobians[l]`, `W_U` from
+`model.unembed`, and a *write-capable* forward hook adapted from
+`ActivationRecorder` (which is read-only — its hook only stores the tensor,
+never returns a modified one). They underlie the "swap" convention documented
+in `data/experiments/README.md` / `data/evaluations/README.md`.
+
+### Estimator variants (§A.7) and formal J-space (§A.8)
+
+- **§A.7 design space** — three independent axes, and the paper's default on
+  Sonnet 4.5: (1) *target layer* — default is the **penultimate** layer, not
+  the final (the last block is specialized for next-token calibration and
+  adds noisy artifacts); (2) *attention gradients* — default lets gradients
+  flow through attention, but a **frozen-QK** variant (zero the gradient
+  through query/key, fixing the attention pattern) can *increase* causal
+  effect; (3) *target positions* — default averages over all `t' ≥ t`;
+  **self-only** (`t'=t`, cross-position attention zeroed) is closer to the
+  logit lens, **future-only** (`t'>t`) isolates the broadcast component.
+  Aggregation is a two-stage mean (over positions within a prompt, then over
+  prompts), optionally median or with norm-outlier prefilters. Results are
+  robust across all of these; **mean-aggregated penultimate** is a small win
+  for extracting intermediates. The lens **beats logit/tuned baselines with
+  as few as ~10 prompts**; the default corpus is 1000 sequences × 128 tokens.
+  Pseudocode is reproduced in §A.7 (matches `jlens.fitting`).
+- **§A.8 formal J-space** — for a sparsity level `k` (~25) and vocab vectors
+  `v_1..v_n`, `F = ⋃_{|S|=k} span{v_i : i∈S}` is the union of `k`-dimensional
+  polyhedral cones (nonnegative combos of any `k` J-lens vectors). The J-space
+  is this union; the paper works with its **distance function**
+  `d_F(x) = min_{|S|=k} ‖x − Π_S x‖` rather than the set directly, which gives
+  a well-defined notion of distance between two such spaces (e.g. lenses built
+  from different Jacobian recipes, or enlarged vocabularies).
 
 ## What the paper found (organized by section — cite section numbers when discussing findings)
 
@@ -264,14 +347,17 @@ implanted J-space content, corroborating the whole workspace account.
 | Fitting on disjoint prompt shards, combine | `JacobianLens.merge` |
 | Interactive slice/heatmap visualization (Figure 5) | `jlens.vis.compute_slice`, `build_page` |
 | `LensModel` protocol (any model library) | `jlens/protocol.py`; HF adapter in `jlens/hf.py` |
-| Lens-coordinate swap / steering intervention | **not yet implemented** in `jlens/lens.py` |
+| Lens-coordinate swap / steering / ablation (formulas: §2.5, Fig 4C) | **not yet implemented** in `jlens/lens.py` — buildable on `lens.jacobians[l]` + `W_U` + a write hook |
+| Per-token probe `⟨v_t, h_l⟩` / sparse decomposition (gradient pursuit) | **not implemented**; §2.5, §4.2 |
 | Template lens / oracle lens (multi-token) | **not implemented**; paper appendix §A.9 only |
 
 ## What's *not* covered in this summary
 
 Appendix sections not detailed above (read the PDF directly if a task needs
-them): §A.13 (flexible-generalization swap details), §A.14 (naming vs.
-avoiding a concept — different layer requirements), §A.15 (ignition
+them): §A.13 (per-trial swap *result* grids for flexible generalization — the
+swap *formula* is §2.5, covered above; §A.13 only reports outcomes: country
+facts 42/48 off-diagonal cells reach rank 1, months/animals/numbers
+progressively worse, 0/48 for number relations at `α=1`), §A.15 (ignition
 details), §A.16–17 (single-layer loading, dual-task competition), §A.20
 (more Assistant-reaction examples), §A.21 (evaluation-awareness measurement
 methodology), §A.22 (LLM-agent auditing system built on the J-lens), §A.23
