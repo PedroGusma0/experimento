@@ -41,7 +41,7 @@ from jlens.fitting import fit  # noqa: E402
 from jlens.hooks import ActivationRecorder  # noqa: E402
 from tests.tiny import TinyDecoder  # noqa: E402
 
-from causal_sweep import position_candidates  # noqa: E402
+from causal_sweep import position_candidates, sweep_positions  # noqa: E402
 
 _PROMPT = "abcdefghij " * 5  # > SKIP_FIRST_N_POSITIONS tokens
 _BAND = [0, 1, 2]  # TinyDecoder's fitted layers stand in for the workspace band
@@ -76,6 +76,98 @@ def test_candidates_are_k_tokens():
     assert all(isinstance(t, int) for t in cands)  # plain python ints
     assert len(set(cands)) == 10  # no duplicates
     assert all(0 <= t < vocab for t in cands)  # in vocabulary range
+
+
+def test_exclude_removes_given_tokens_and_backfills():
+    """The anti-confound guard mechanism (§3.5.2): tokens passed via `exclude`
+    never appear in the result, and the next-highest-scoring tokens take their
+    place so the result is still exactly `k` long."""
+    model, lens, acts = _model_lens_residuals()
+    residual_by_layer = {layer: acts[layer][0, 20] for layer in _BAND}
+
+    baseline = position_candidates(lens, model.lm_head.weight, residual_by_layer, k=10)
+    to_exclude = baseline[:3]  # the 3 highest-scoring tokens, by construction
+
+    filtered = position_candidates(
+        lens, model.lm_head.weight, residual_by_layer, k=10, exclude=to_exclude
+    )
+    assert len(filtered) == 10  # still exactly k, backfilled
+    assert not set(to_exclude) & set(filtered)  # excluded tokens gone
+    assert set(baseline[3:]).issubset(set(filtered))  # next-best took their place
+
+
+def test_exclude_raises_when_k_exceeds_selectable():
+    """k must not silently shrink: if exclusion leaves fewer than k tokens
+    selectable, position_candidates raises rather than returning a short list."""
+    model, lens, acts = _model_lens_residuals()
+    residual_by_layer = {layer: acts[layer][0, 20] for layer in _BAND}
+    vocab = model.lm_head.out_features  # 32
+    k = 10
+    exclude_all_but_k_minus_1 = list(range(vocab - (k - 1)))  # leaves k-1 selectable
+    try:
+        position_candidates(
+            lens, model.lm_head.weight, residual_by_layer,
+            k=k, exclude=exclude_all_but_k_minus_1,
+        )
+        raise AssertionError("expected ValueError, none raised")
+    except ValueError:
+        pass
+
+
+def _tiny_sweep_callables(model):
+    """run_forward + a fixed-token score_fn for TinyDecoder (no malign/benign
+    concept exists, so we attribute the probability of an arbitrary token)."""
+
+    def run_forward(input_ids):
+        hidden = model.forward(input_ids).last_hidden_state
+        return model.unembed(hidden)[0]  # [seq_len, vocab]
+
+    target_token = 5
+
+    def score_fn(logits):
+        return float(torch.softmax(logits.float(), dim=-1)[target_token])
+
+    return run_forward, score_fn
+
+
+def test_sweep_returns_one_signed_record_per_swept_position():
+    """sweep_positions covers [p_start, p_end), respects the input boundary,
+    and each record's `nota` equals score_ablate − score_control exactly."""
+    model, lens, _ = _model_lens_residuals()
+    input_ids = model.encode(_PROMPT)
+    seq_len = input_ids.shape[1]
+    run_forward, score_fn = _tiny_sweep_callables(model)
+
+    p_start = 16  # SKIP_FIRST_N_POSITIONS
+    records = sweep_positions(
+        model.layers, lens, model.lm_head.weight, input_ids,
+        run_forward, score_fn, layers=_BAND, k=6, p_start=p_start, seed=0,
+    )
+
+    positions = [r["position"] for r in records]
+    assert positions == list(range(p_start, seq_len))  # covers the range, in order
+    assert all(p < seq_len for p in positions)  # never a generated position
+    for r in records:
+        assert r["nota"] == r["score_ablate"] - r["score_control"]  # signed score
+        for key in ("score_clean", "score_ablate", "score_control"):
+            assert 0.0 <= r[key] <= 1.0  # probabilities
+        assert r["n_candidates"] == 6
+
+
+def test_sweep_respects_explicit_position_window():
+    """p_start/p_end bound the sweep; p_end is clamped to the input length."""
+    model, lens, _ = _model_lens_residuals()
+    input_ids = model.encode(_PROMPT)
+    seq_len = input_ids.shape[1]
+    run_forward, score_fn = _tiny_sweep_callables(model)
+
+    records = sweep_positions(
+        model.layers, lens, model.lm_head.weight, input_ids,
+        run_forward, score_fn, layers=_BAND, k=6,
+        p_start=18, p_end=seq_len + 50,  # deliberately past the end
+    )
+    positions = [r["position"] for r in records]
+    assert positions == list(range(18, seq_len))  # clamped to seq_len, not seq_len+50
 
 
 def _main() -> int:

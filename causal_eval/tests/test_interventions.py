@@ -53,6 +53,7 @@ from interventions import (  # noqa: E402
     ablate_span,
     lens_vector,
     lens_vectors,
+    matched_norm_control,
     steer,
     swap,
 )
@@ -101,6 +102,33 @@ def test_ablate_span_zeroes_projection_onto_all_vectors():
     h1 = ablate_span(h, V)
     # h1 is orthogonal to every column of V
     assert (h1 @ V).abs().max() < 1e-4
+
+
+def test_matched_norm_control_matches_ablation_norm():
+    """The control perturbs h by exactly the norm ablate_span removes, but
+    along a random subspace — the fair baseline for "did *these* vectors
+    matter vs. any equal-sized perturbation" (§3.5.2 / §A.23)."""
+    torch.manual_seed(30)
+    h = torch.randn(4, 8)
+    V = torch.randn(8, 3)
+    gen = torch.Generator().manual_seed(1)
+
+    control = matched_norm_control(h, V, generator=gen)
+    # per-row: ‖h − control‖ == ‖h − ablate_span(h, V)‖
+    ablate_norm = (h - ablate_span(h, V)).norm(dim=-1)
+    control_norm = (h - control).norm(dim=-1)
+    torch.testing.assert_close(control_norm, ablate_norm, atol=1e-4, rtol=0)
+    # but the control is NOT the ablation (different, random, direction)
+    assert (control - ablate_span(h, V)).norm() > 1e-2
+
+
+def test_matched_norm_control_is_reproducible_with_seed():
+    torch.manual_seed(31)
+    h = torch.randn(4, 8)
+    V = torch.randn(8, 3)
+    a = matched_norm_control(h, V, generator=torch.Generator().manual_seed(7))
+    b = matched_norm_control(h, V, generator=torch.Generator().manual_seed(7))
+    torch.testing.assert_close(a, b)
 
 
 def test_swap_exchanges_the_two_lens_coordinates():

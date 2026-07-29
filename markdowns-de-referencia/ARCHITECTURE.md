@@ -408,6 +408,53 @@ position, aggregated across the band; top-`k`-by-inner-product form, with an
 below Fase 0 in this section (anti-confound guard, matched-norm control,
 per-position sweep, signed score) is still design only, not yet coded.
 
+**Plumbing validated end-to-end on the real Qwen3-1.7B guardrail, across all
+three environments that matter — `causal_eval/run_plumbing_check.py`.** This
+script runs `position_candidates` + `ablate_span` (via `InterventionHook`,
+with the anti-confound guard active) at the decision position, on two
+seeds, plus an ordering check (`readout()` under an active hook) — not a
+scientific run (only one position, one layer), just confirmation that the
+actual mechanism survives contact with the real model:
+
+- **Local, CPU, bf16.** Uncovered a real bug: `torch.linalg.pinv` (used by
+  `ablate_span`/`swap`) has no bf16 CPU kernel — `RuntimeError: expected a
+  tensor with 2 or more dimensions of float, double, cfloat or cdouble
+  types`. `TinyDecoder`'s tests never caught this because they default to
+  float32. Fixed in `causal_eval/interventions.py`: the pseudoinverse is now
+  always computed in float32 and cast back to the input's dtype. Covered by
+  a new regression test,
+  `causal_eval/tests/test_interventions.py::test_ablate_span_and_swap_run_in_bf16`
+  (11/11 passing, up from 10/10). Note: fp32 loading OOMs on this machine's
+  ~7.7GB RAM — bf16 (~3.8GB) is the only viable local dtype.
+- **RunPod, CUDA, float32** (`python causal_eval/run_plumbing_check.py
+  --device cuda --dtype float32`) — the two axes bf16/CPU couldn't cover:
+  does the write-hook survive on real CUDA kernels, and does removing the
+  bf16 workaround (fp32 sidesteps the whole pinv-precision question) change
+  anything. It didn't: `‖h‖`/`‖Δlogits‖` came out numerically consistent
+  with the bf16/CPU run (e.g. malign seed: 668.00/384.000 CPU vs.
+  669.73/381.234 CUDA), identical candidate sets selected, no crash,
+  `finite=True` throughout, `PLUMBING OK`.
+
+Net result: `InterventionHook`, `ablate_span`, and `position_candidates` are
+now confirmed correct and correctly plumbed in three environments —
+`TinyDecoder` (mechanical invariants), Qwen3-1.7B bf16/CPU, and Qwen3-1.7B
+float32/CUDA. Verdict did not flip in either seed in this plumbing check —
+expected and not a finding: only one position and one layer were
+intervened on, not the full per-position × band sweep the real Fase 1
+design calls for.
+
+**Local vs. pod for what's left.** Everything remaining in this section
+(anti-confound guard as an isolated tested unit, matched-norm control,
+the position-sweep loop, the signed score, `results_causal/`) is
+orchestration and arithmetic on top of primitives already proven safe in
+all three environments above — none of it introduces new real-model risk,
+so all of it is buildable and testable locally on `TinyDecoder`, no pod
+needed. The pod only becomes necessary again for the scaled, scientifically
+meaningful run (many prompts × many positions each) — CPU can still run a
+full per-position sweep on one or two real prompts locally first (slow, but
+not infeasible) as a further plumbing-adjacent check before committing pod
+time/cost to the real experiment.
+
 A later design session revisited three choices from v1 after a closer
 rereading of §3.5.2 and a discussion of what "per-token importance" actually
 requires.
@@ -689,12 +736,20 @@ causal_eval/                     # root-level sibling of guardrail_eval/ (causal
     into completing the persona's roleplay text instead of emitting a
     clean verdict. This is a real signal about wrapping attacks degrading
     guardrail output reliability, not a pipeline bug.
-- Interventions: 10/10 invariant tests pass for `causal_eval/interventions.py`
-  (steer/ablate/swap + write hook) against `TinyDecoder` — mechanical
-  correctness only, no semantic/causal validation yet (needs Qwen3).
+- Interventions: 11/11 invariant tests pass for `causal_eval/interventions.py`
+  (steer/ablate/swap + write hook, including a bf16 regression test) against
+  `TinyDecoder` — mechanical correctness only.
 - Causal v2 Fase 0: 1/1 test passes for `causal_eval/causal_sweep.py`'s
   `position_candidates` (candidate selection returns exactly `k` distinct
-  in-range token ids against `TinyDecoder`) — again mechanical only.
+  in-range token ids against `TinyDecoder`) — mechanical only.
+- Plumbing on the real guardrail: `causal_eval/run_plumbing_check.py`
+  confirms `position_candidates` + `ablate_span` (+ anti-confound guard, +
+  hook-ordering with `readout()`) run correctly against the real
+  Qwen3-1.7B — validated on CPU/bf16 (uncovered and fixed the
+  `torch.linalg.pinv`-has-no-bf16-CPU-kernel bug above) and on RunPod
+  CUDA/float32 (numerically consistent results, no crash). Still only a
+  single-position, single-layer check — not yet the full per-position sweep,
+  so the verdict not flipping is expected, not a finding.
 
 ## Not yet built (explicitly out of scope so far)
 

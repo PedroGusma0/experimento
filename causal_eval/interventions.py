@@ -111,6 +111,41 @@ def ablate_span(h: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     return h - coeffs @ V.to(h.dtype).transpose(-1, -2)
 
 
+def matched_norm_control(
+    h: torch.Tensor, V: torch.Tensor, *, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    """Matched-norm random-direction control for :func:`ablate_span`
+    (§3.5.2 / §A.23, Figure 22/86).
+
+    Removes ``h``'s projection onto ``k`` **random** directions, rescaled so
+    the induced residual-stream change has the *same norm* as the change
+    :func:`ablate_span` would induce with ``V``. This isolates "ablating
+    *these specific* J-lens vectors mattered" from "any equal-sized
+    perturbation at this site mattered" — the reported causal effect is
+    ``metric_ablation − metric_control``, so the generic effect cancels.
+
+    ``V`` is ``[d_model, k]`` (the real ablation's vectors); the control uses
+    a fresh random ``[d_model, k]`` instead. Pass a seeded ``generator`` for
+    reproducibility. Norms are matched per row, so this is correct when ``h``
+    covers several positions at once.
+
+    This is the plainest of the paper's control battery (a random Gaussian
+    subspace); §A.23 also uses activation-manifold / SAE-derived controls,
+    which are harder bars to clear — a candidate refinement, not used here.
+    """
+    d = h.shape[-1]
+    k = V.shape[-1]
+    # Generate on CPU (generator is CPU by default) then move — avoids the
+    # generator-must-match-device constraint of torch.randn(device=...).
+    R = torch.randn(d, k, generator=generator).to(h.dtype).to(h.device)
+    delta_ablate = h - ablate_span(h, V)  # [..., d]: what the real ablation removes
+    delta_rand = h - ablate_span(h, R)  # [..., d]: what a random ablation removes
+    target = delta_ablate.norm(dim=-1, keepdim=True)  # [..., 1]
+    current = delta_rand.norm(dim=-1, keepdim=True)
+    scaled = delta_rand * (target / (current + 1e-8))  # rescale to matched norm
+    return h - scaled
+
+
 def swap(
     h: torch.Tensor, v_s: torch.Tensor, v_t: torch.Tensor, alpha: float = 1.0
 ) -> torch.Tensor:

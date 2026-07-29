@@ -9,30 +9,40 @@ pipeline v2"). It builds on the low-level primitives in `interventions.py`
 prompt, a signed per-token importance score for the guardrail's `malign`
 verdict.
 
-Built incrementally, one tested unit at a time. So far:
+Built incrementally, one tested unit at a time:
 
 - **Fase 0 — candidate selection** (:func:`position_candidates`): for one token
   position, the `k` J-lens vocabulary tokens most active there, aggregated
-  across the workspace band.
+  across the workspace band, with the anti-confound guard exposed as `exclude`.
+- **Fase 1 + 2 — the per-position ablation sweep** (:func:`sweep_positions`):
+  for every input position, group-ablate its candidates (vs. a matched-norm
+  random control), read the effect on a caller-supplied verdict score at the
+  decision position, and return the signed per-position score
+  `nota(p) = score_ablate(p) − score_control(p)`.
 
-Still to come (see ARCHITECTURE.md): the anti-confound guard, the matched-norm
-random control, the per-position ablation sweep, and the signed score
-`nota(p) = P_ablate(p) − P_controle(p)`.
-
-Everything here is *mechanical*; semantic/causal validity is only established
-by running it on the trained guardrail, never on the `TinyDecoder` the unit
-tests use.
+The sweep is model-agnostic (driven by two caller callables, `run_forward`
+and `score_fn`) so it unit-tests against `TinyDecoder`. Everything here is
+*mechanical*; semantic/causal validity is only established by running it on
+the trained guardrail (see `run_causal_pipeline.py`), never on `TinyDecoder`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import torch
+from torch import nn
 
+from jlens.fitting import SKIP_FIRST_N_POSITIONS
+from jlens.hooks import ActivationRecorder
 from jlens.lens import JacobianLens
 
-from interventions import lens_vectors
+from interventions import (
+    InterventionHook,
+    ablate_span,
+    lens_vectors,
+    matched_norm_control,
+)
 
 _AGGREGATES = ("max", "mean")
 
@@ -112,3 +122,128 @@ def position_candidates(
 
     top = torch.topk(scores, k).indices
     return [int(t) for t in top]
+
+
+# ---------------------------------------------------------------------------
+# Fase 1 + 2: the per-position ablation sweep with a signed score.
+# ---------------------------------------------------------------------------
+
+
+def sweep_positions(
+    blocks: Sequence[nn.Module],
+    lens: JacobianLens,
+    unembed_weight: torch.Tensor,
+    input_ids: torch.Tensor,
+    run_forward: Callable[[torch.Tensor], torch.Tensor],
+    score_fn: Callable[[torch.Tensor], float],
+    *,
+    layers: Sequence[int],
+    k: int = 10,
+    decision_position: int = -1,
+    p_start: int | None = None,
+    p_end: int | None = None,
+    aggregate: str = "max",
+    guard_top_n: int = 10,
+    seed: int = 0,
+) -> list[dict]:
+    """Per-position causal attribution sweep (v2 Fase 1 + 2).
+
+    For every input position ``p`` in ``[p_start, p_end)``, group-ablate the
+    ``k`` J-lens vectors most active at ``p`` (across ``layers``) and measure
+    the effect on ``score_fn`` read at ``decision_position``, against a
+    matched-norm random-direction control. Returns one record per position
+    with the signed score ``nota(p) = score_ablate(p) − score_control(p)``.
+
+    Model-agnostic by construction — the model shows up only through:
+
+    Args:
+        blocks: The residual blocks to hook (``model.layers``).
+        lens: A fitted :class:`jlens.lens.JacobianLens`.
+        unembed_weight: ``W_U``, ``[vocab, d_model]``.
+        input_ids: ``[1, seq_len]`` — the rendered prompt only (no generated
+            tokens; the sweep never crosses into positions the model would
+            generate, so an input token is always attributable to the input).
+        run_forward: ``input_ids -> logits`` of shape ``[seq_len, vocab]`` (all
+            positions). Called clean and again under each `InterventionHook`;
+            it must run the model's forward so the hook fires (e.g.
+            ``lambda ids: gl.hf(ids).logits[0]``). No-grad is applied around it.
+        score_fn: ``logits[vocab] -> float`` — the scalar whose change is
+            attributed (e.g. ``P(malign)`` at the decision position). Kept
+            caller-side because "malign" is guardrail-specific; `TinyDecoder`
+            tests pass an arbitrary fixed-token probability.
+        layers: Band layer indices to ablate across (all in one forward pass;
+            band width costs no extra passes).
+        k: Candidates per position.
+        decision_position: Where ``score_fn`` is read (default ``-1``).
+        p_start: First swept position. Defaults to ``SKIP_FIRST_N_POSITIONS``
+            (the fitting.py attention-sink skip).
+        p_end: One past the last swept position. Defaults to ``seq_len`` — the
+            input/generation boundary (never a generated token).
+        aggregate: Passed to :func:`position_candidates` (``"max"``/``"mean"``).
+        guard_top_n: Anti-confound guard width — exclude the model's own clean
+            next-token top-``guard_top_n`` at each position (§3.5.2).
+        seed: Seeds the control's random directions for reproducibility.
+
+    Returns:
+        A list of dicts (ascending position), each with ``position``,
+        ``n_candidates``, ``score_ablate``, ``score_control``, and ``nota``.
+        ``score_clean`` (the un-intervened baseline) is attached to every row
+        for reference.
+    """
+    seq_len = int(input_ids.shape[1])
+    if p_start is None:
+        p_start = SKIP_FIRST_N_POSITIONS
+    if p_end is None:
+        p_end = seq_len
+    p_end = min(p_end, seq_len)  # never cross into generated positions
+
+    generator = torch.Generator().manual_seed(seed)
+    V_all = {layer: lens_vectors(lens, unembed_weight, layer) for layer in layers}
+
+    with torch.no_grad():
+        # One clean, recorded pass: band residuals at every position (for
+        # candidate selection) + clean logits at every position (decision
+        # readout + the per-position anti-confound guard).
+        with ActivationRecorder(blocks, at=list(layers)) as rec:
+            clean_logits = run_forward(input_ids)  # [seq_len, vocab]
+            residuals = {
+                layer: rec.activations[layer][0].detach() for layer in layers
+            }
+        score_clean = score_fn(clean_logits[decision_position])
+
+        results: list[dict] = []
+        for p in range(p_start, p_end):
+            residual_by_layer = {layer: residuals[layer][p] for layer in layers}
+            guard = clean_logits[p].topk(guard_top_n).indices.tolist()
+            cands = position_candidates(
+                lens, unembed_weight, residual_by_layer,
+                k=k, exclude=guard, aggregate=aggregate,
+            )
+            V = {layer: V_all[layer][cands].T for layer in layers}  # [d_model, k]
+
+            ablate_edits = {
+                layer: (lambda x, V=V[layer]: ablate_span(x, V)) for layer in layers
+            }
+            with InterventionHook(blocks, ablate_edits, positions=[p]):
+                score_ablate = score_fn(run_forward(input_ids)[decision_position])
+
+            control_edits = {
+                layer: (
+                    lambda x, V=V[layer]: matched_norm_control(x, V, generator=generator)
+                )
+                for layer in layers
+            }
+            with InterventionHook(blocks, control_edits, positions=[p]):
+                score_control = score_fn(run_forward(input_ids)[decision_position])
+
+            results.append(
+                {
+                    "position": p,
+                    "n_candidates": len(cands),
+                    "score_clean": score_clean,
+                    "score_ablate": score_ablate,
+                    "score_control": score_control,
+                    "nota": score_ablate - score_control,
+                }
+            )
+    return results
