@@ -1,6 +1,6 @@
 # Copyright 2026 Pedro (guardrail_eval experiment)
 # SPDX-License-Identifier: Apache-2.0
-"""Invariant tests for `guardrail_eval/interventions.py` against `TinyDecoder`.
+"""Invariant tests for `causal_eval/interventions.py` against `TinyDecoder`.
 
 What these tests PROVE: the steer/ablate/swap primitives and the write-capable
 hook are *algebraically correct and correctly plumbed* into `jlens` — swap
@@ -17,10 +17,10 @@ guardrail. These are unit invariants, not the experiment.
 fitted ``J_l`` is exact; that keeps the invariants clean and independent of any
 estimator noise.
 
-pytest is not installed in `guardrail_eval/.venv`, so this file is a
-self-contained script: run it with
+pytest is not installed in `guardrail_eval/.venv` (the shared venv this
+sub-project reuses), so this file is a self-contained script: run it with
 
-    guardrail_eval/.venv/Scripts/python.exe guardrail_eval/tests/test_interventions.py
+    guardrail_eval/.venv/Scripts/python.exe causal_eval/tests/test_interventions.py
 
 (it is also importable/collectable by pytest where available).
 """
@@ -37,11 +37,11 @@ import torch
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-# And the guardrail_eval dir, so `interventions` imports whether run from root
-# or from inside guardrail_eval/.
-_GE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _GE_ROOT not in sys.path:
-    sys.path.insert(0, _GE_ROOT)
+# And the causal_eval dir, so `interventions` imports whether run from the
+# repo root or from inside causal_eval/.
+_PKG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
 
 from jlens.fitting import fit  # noqa: E402
 from jlens.hooks import ActivationRecorder  # noqa: E402
@@ -135,6 +135,31 @@ def test_swap_is_an_involution_at_alpha_one():
     h = torch.randn(6, 8)
     v_s, v_t = torch.randn(8), torch.randn(8)
     torch.testing.assert_close(swap(swap(h, v_s, v_t), v_s, v_t), h, atol=1e-4, rtol=0)
+
+
+def test_ablate_span_and_swap_run_in_bf16():
+    """Regression test: torch.linalg.pinv has no bf16 CPU kernel, so both
+    ablate_span and swap must upcast to float32 internally before calling it
+    and cast back. This bug shipped past all-float32 TinyDecoder tests above
+    and only surfaced when run against the real (bf16) Qwen3 guardrail —
+    caught by causal_eval/run_plumbing_check.py, not by this suite, until now.
+    """
+    torch.manual_seed(7)
+    h = torch.randn(6, 8, dtype=torch.bfloat16)
+    V = torch.randn(8, 3, dtype=torch.bfloat16)
+    v_s, v_t = torch.randn(8, dtype=torch.bfloat16), torch.randn(8, dtype=torch.bfloat16)
+
+    h1 = ablate_span(h, V)
+    assert h1.dtype == torch.bfloat16
+    assert torch.isfinite(h1.float()).all()
+    # bf16 has ~3 decimal digits of precision; the pinv is computed in fp32
+    # internally, but h1 is cast back to bf16, so the residual is dominated by
+    # that final rounding, not by the projection math itself.
+    assert (h1.float() @ V.float()).abs().max() < 1e-1
+
+    h2 = swap(h, v_s, v_t)
+    assert h2.dtype == torch.bfloat16
+    assert torch.isfinite(h2.float()).all()
 
 
 # --- lens vectors --------------------------------------------------------------

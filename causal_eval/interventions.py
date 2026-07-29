@@ -5,9 +5,9 @@
 The `jlens` library ships fitting + reading only (`fit` / `apply` /
 `transport`); the paper's two causal *writing* primitives are described but
 not implemented there (see `markdowns-de-referencia/PAPER_SUMMARY.md`,
-"The J-lens's read/write primitives", §2.5 / Figure 4C). Because
-`guardrail_eval/` must not modify `jlens/`, this module builds them here, on
-top of the three ingredients `jlens` already exposes:
+"The J-lens's read/write primitives", §2.5 / Figure 4C). Because neither
+`causal_eval/` nor `guardrail_eval/` may modify `jlens/`, this module builds
+them here, on top of the three ingredients `jlens` already exposes:
 
 - ``J_l``          — ``JacobianLens.jacobians[layer]`` (a fitted lens),
 - ``W_U``          — the model's unembedding weight (e.g. ``lm_head.weight``),
@@ -99,10 +99,16 @@ def ablate_span(h: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
 
     Uses the least-squares subspace projector ``P = V(VᵀV)⁺Vᵀ`` and returns
     ``h − hP``, so it is exact even when the columns of ``V`` are not
-    orthonormal (J-lens vectors never are)."""
-    Vpinv = torch.linalg.pinv(V.to(h.dtype).to(h.device))  # [k, d]
+    orthonormal (J-lens vectors never are).
+
+    ``torch.linalg.pinv`` (SVD-based) has no bf16/fp16 CPU kernel, so the
+    pseudoinverse is always computed in float32 and cast back to ``h``'s
+    dtype — needed for real (typically bf16) guardrail models; `TinyDecoder`'s
+    tests default to float32, where this upcast is a no-op."""
+    V = V.to(h.device)
+    Vpinv = torch.linalg.pinv(V.float()).to(h.dtype)  # [k, d]
     coeffs = h @ Vpinv.transpose(-1, -2)  # [..., k] = V⁺ h
-    return h - coeffs @ V.to(h.dtype).to(h.device).transpose(-1, -2)
+    return h - coeffs @ V.to(h.dtype).transpose(-1, -2)
 
 
 def swap(
@@ -116,11 +122,14 @@ def swap(
     and returns ``h + α·V(σ(c) − c)`` where ``σ`` swaps the two entries of
     ``c``. Default ``α=1``; the paper uses ``α=2`` when ``α=1`` moves the
     activation in the right direction but underdrives it (§A.13).
+
+    Like :func:`ablate_span`, the pseudoinverse is computed in float32 and
+    cast back (no bf16/fp16 CPU kernel for ``torch.linalg.pinv``).
     """
     v_s = v_s.to(h.dtype).to(h.device)
     v_t = v_t.to(h.dtype).to(h.device)
     V = torch.stack([v_s, v_t], dim=-1)  # [d, 2]
-    Vpinv = torch.linalg.pinv(V)  # [2, d]
+    Vpinv = torch.linalg.pinv(V.float()).to(h.dtype)  # [2, d]
     c = h @ Vpinv.transpose(-1, -2)  # [..., 2] = V⁺ h
     c_swapped = c.flip(-1)  # σ(c): swap the two entries
     delta = alpha * (c_swapped - c)  # [..., 2]

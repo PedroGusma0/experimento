@@ -228,18 +228,30 @@ aggregate + investigator accuracy); with `--attack both`, an additional
 
 ### Causal interventions — steer / ablate / swap primitives
 
+> **Folder note.** The causal work lives in a **separate root-level folder,
+> `causal_eval/`**, a sibling of `guardrail_eval/` — not inside it. It was
+> split out because the causal validation pipeline (v2, below) diverges
+> substantially from `guardrail_eval/`'s phases 0–3 (no target model, no
+> investigator/judge, a per-position ablation sweep instead of a read-only
+> audit loop). `causal_eval/` follows the same rules: it only imports `jlens`
+> as a library and never modifies `jlens/`. It reuses the shared
+> `guardrail_eval/.venv` (there is no separate venv). `interventions.py` and
+> its test were moved here from `guardrail_eval/` via `git mv` (history
+> preserved).
+
 The pipeline above is **read-only** interpretability: it surfaces which
 concepts drive the guardrail's verdict but never proves they *cause* it. The
 paper's two causal *writing* primitives (steering/ablation and the
 lens-coordinate swap of Figure 4C; see `PAPER_SUMMARY.md`, "The J-lens's
 read/write primitives", §2.5) are described but **not** implemented in
-`jlens/lens.py`. Since `guardrail_eval/` must not modify `jlens/`, they are
-built here, on the three ingredients `jlens` already exposes: `J_l`
-(`JacobianLens.jacobians[layer]`), `W_U` (the model's `lm_head.weight`), and a
-*write-capable* forward hook (which `jlens.hooks.ActivationRecorder`
-deliberately is not — its hook only reads).
+`jlens/lens.py`. Since neither `causal_eval/` nor `guardrail_eval/` may modify
+`jlens/`, they are built here, on the three ingredients `jlens` already
+exposes: `J_l` (`JacobianLens.jacobians[layer]`), `W_U` (the model's
+`lm_head.weight`), and a *write-capable* forward hook (which
+`jlens.hooks.ActivationRecorder` deliberately is not — its hook only reads).
 
-**`interventions.py`** — model-agnostic, operates on residual-stream tensors:
+**`causal_eval/interventions.py`** — model-agnostic, operates on
+residual-stream tensors:
 - `lens_vectors(lens, W_U, layer)` / `lens_vector(...)` — the J-lens vectors
   `v_t` = rows of `W_U · J_l` (drops the final `norm`, matching §2.1).
 - `steer(h, v, α)` = `h + α·v`; `ablate(h, v)` projects out the component of
@@ -253,7 +265,7 @@ deliberately is not — its hook only reads).
   pass and cleanly removes itself on exit. Enter it before an
   `ActivationRecorder` on the same blocks if the recorder must see the edit.
 
-**`tests/test_interventions.py`** — 10 **invariant** tests against
+**`causal_eval/tests/test_interventions.py`** — 10 **invariant** tests against
 `jlens`'s `TinyDecoder` (whose exactly-linear blocks make `J_l` exact, so the
 algebra is clean). They verify the primitives are *mechanically correct and
 correctly plumbed*: steer moves by exactly `α·v`; ablate zeroes the
@@ -264,9 +276,332 @@ exit. **These prove nothing semantic or causal** — `TinyDecoder` has untrained
 weights and no interpretable vocabulary; "swap Soccer→Rugby flips the output"
 can only be shown on the trained Qwen3-1.7B guardrail. This test de-risks the
 *engineering* so that a null result on Qwen3 later reads as a finding, not a
-bug. `guardrail_eval/.venv` has no pytest, so the file is a self-contained
-script: `guardrail_eval/.venv/Scripts/python.exe guardrail_eval/tests/test_interventions.py`
+bug. The shared `guardrail_eval/.venv` has no pytest, so the file is a
+self-contained script:
+`guardrail_eval/.venv/Scripts/python.exe causal_eval/tests/test_interventions.py`
 (also pytest-collectable where available).
+
+### Planned — causal validation pipeline v1 (design only, not yet implemented)
+
+**Superseded by the "v2" design below** — kept here as the record of the
+first iteration and why it changed, not as the current plan.
+
+A design for a **script-only** causal validation loop, using the
+`interventions.py` primitives above once they are run against the real
+Qwen3-1.7B guardrail (not just `TinyDecoder`). **No code exists yet for this
+section** — it records the agreed design so implementation can start directly
+from it later.
+
+**Why no investigator/judge here.** Phase 3's investigator+judge exist to
+*interpret* a readout ("does this concept, read from the lens, explain the
+verdict?") — an interpretive question that needs an LLM to read and score.
+Ablation/swap replaces that with a *mechanical* question: "if I remove/swap
+the concept the lens surfaces, does the guardrail's verdict actually change?"
+That's a forward pass and a probability comparison — answerable by a plain
+script, with **zero API calls and zero LLM-judge cost**. `ground_truth.py`'s
+label × verdict logic is still reused, but only to *select* which
+intervention to run and what direction to expect — not to grade anything.
+
+**Pipeline shape.** One driver, `run_causal_pipeline.py` (planned name),
+loads the guardrail once (no two-phase memory dance — no target model, no
+agent). Per prompt:
+1. Clean pass: `classify()` + `readout_multi()` at the decision position →
+   verdict, `P(verdict)`, and the top-`k=10` most active J-lens vectors in
+   the workspace band (the automatic candidate-concept set — no hand-authored
+   lexicon needed).
+2. Case label: `(label_true, verdict_clean)` → `TP`/`FP`/`FN`/`TN` (reuses
+   `ground_truth.py`'s confusion-matrix logic).
+3. Interventions, all via `InterventionHook` in the workspace band
+   (L14–26), skipping any token already in the clean pass's top-10 output
+   (the §3.5.2 anti-confound guard):
+   - **Group ablation** — `ablate_span` on all `k=10` active vectors at once.
+     Answers "does the J-space *as a whole* matter here?" (§3.5.2).
+   - **Leave-one-out** — `ablate` on each of the `k=10` vectors
+     individually, the rest untouched. Answers "*which specific* concept
+     carries the effect?" — resolves the case where a fixed single-concept
+     test would misattribute effect (e.g. testing only `illegal` while
+     `harmful`/`fake`/`injection` co-occur in the same readout and one of
+     those is the actual driver, not `illegal`). Costs `k` extra forward
+     passes per prompt in exchange for per-token attribution.
+   - **Swap** — `swap(v_s, v_t)` between a harm concept and a benign
+     control concept, `α=1` (retry `α=2` per §A.13 if underdriven).
+   - **Steer** — `steer(v_harm, +α)`, used specifically on FN/TN cases to
+     test *sufficiency* (does injecting the missing harm concept flip a
+     missed detection to `malign`?).
+   - **Control** — `ablate_span` on `k` matched-norm **random** directions,
+     run alongside every group ablation; isolates the effect of ablating
+     *these specific* vectors from the effect of any equal-sized perturbation.
+4. Per intervention, record: `verdict_after`, `p_verdict_after`, `delta_p`,
+   `kl` (`KL(clean ‖ intervened)` on the next-token distribution at the
+   decision position — the exact §A.6 "ablation effect" metric), `flipped`
+   (bool).
+
+**Case validity table** (what each `(case, intervention)` pairing tests):
+
+| Case | Intervention | Expected if lens is causal | Validates |
+|---|---|---|---|
+| TP | ablate harm concept(s) | verdict flips to `benign` | necessity |
+| FP | ablate the spurious concept the lens shows | verdict flips to `benign` | error diagnosis |
+| FN | `steer(v_harm, +α)` | verdict flips to `malign` | sufficiency |
+| TN | `steer(v_harm, +α)` | verdict flips to `malign` | sufficiency (control) |
+| any | `swap(v_harm, v_benign)` | verdict follows the swapped-in concept | clean counterfactual |
+
+**Metrics** (all also computed for the random-direction control, so the
+reported number is the **control-adjusted** effect — `metric_intervention −
+metric_control` — not the raw one):
+- **Flip rate** — fraction where the top-1 verdict changes.
+- **Δp(verdict)** — mean drop in the clean verdict's probability.
+- **Ablation-KL** / **swap-success rate** — the paper's own §A.6 causal
+  metrics, reused directly.
+- **Leave-one-out attribution ranking** — per-token mean `delta_p`/`kl`
+  across the corpus, to see whether one token (e.g. `harmful`) systematically
+  dominates over co-occurring ones (e.g. `illegal`, `fake`), or whether the
+  effect is redundant across several.
+
+**The open scientific question this is designed to answer (§3.5 caveat).**
+The paper found that *shallow classification* tasks (MMLU, sentiment) survive
+J-space ablation intact — only flexible/generative tasks depend on it. The
+guardrail's binary `malign`/`benign` verdict looks exactly like that shallow-
+classification case, so a **null result (no flips) is a real, expected-
+possible outcome, not a bug**: it would mean the lens's readout is
+descriptive (shows what the guardrail "sees") but the verdict itself is
+computed outside the J-space — informative either way for picking an XAI
+method for the main project's guardrail.
+
+**Estimated cost.** ~`k + 5` forward passes per prompt (`k=10` LOO + group +
+control + swap + steer) — API cost is **$0** (no investigator/judge). CPU
+smoke (~30 prompts): rough order of ~15–25s/prompt underlying (the readout +
+unembed over Qwen3's 151k vocab is the expensive part) → ~10–15 min total. RunPod
+GPU, full corpus (460 prompts): ~1–2s/pass → single-digit minutes, well under
+$1. Contrast with Phase 3's audit loop, which was API- and agent-call-bound
+(~130+ CPU-hours at full corpus scale) — this loop is local-compute-bound
+instead, and roughly an order of magnitude cheaper to run at full scale.
+
+**Planned `results_causal/` output** (mirrors `results_audit/`'s per-attack
+file pattern):
+
+```
+results_causal/
+├── causal_readouts_<attack>.jsonl      # 1 row/prompt: clean verdict, P(verdict), case, active_vectors (top-k candidates)
+├── causal_interventions_<attack>.jsonl # N rows/prompt: one per intervention (group_ablation/leave_one_out/swap/steer/control_random)
+├── causal_summary_<attack>.csv         # aggregated by (case × intervention_type): flip_rate, mean_delta_p, mean_kl, control-adjusted flip_rate
+└── causal_summary_combined.csv         # cross-attack aggregate (only with --attack both)
+```
+
+`causal_interventions_<attack>.jsonl` rows key on `pool_index` +
+`intervention_type` + `targets` (the token(s) touched; `null` for
+`control_random`) and join back to `causal_readouts` for case-based slicing.
+`causal_summary` adds a control-adjusted-flip-rate column
+(`flip_rate − flip_rate_control`) as the headline "is the lens causally
+faithful here?" number, plus a separate per-token ranking table for
+leave-one-out attribution.
+
+### Causal validation pipeline v2 (most up-to-date design; supersedes v1 above)
+
+**Implementation started — being built incrementally, one tested unit at a
+time, in `causal_eval/causal_sweep.py`.** Done so far: **Fase 0 candidate
+selection** (`position_candidates` — top-`k` most active J-lens tokens at a
+position, aggregated across the band; top-`k`-by-inner-product form, with an
+`exclude` param ready for the anti-confound guard), covered by
+`causal_eval/tests/test_causal_sweep.py::test_candidates_are_k_tokens`
+(returns exactly `k` distinct in-range token ids; 1/1 passing). Everything
+below Fase 0 in this section (anti-confound guard, matched-norm control,
+per-position sweep, signed score) is still design only, not yet coded.
+
+A later design session revisited three choices from v1 after a closer
+rereading of §3.5.2 and a discussion of what "per-token importance" actually
+requires.
+
+**What changed from v1, and why:**
+
+- **Candidate selection moved from "once, at the decision position" to
+  "recomputed at every position."** §3.5.2's own wording is "**at each token
+  position**, across a band of layers, we identify the k=10 most strongly
+  activated J-lens vectors" — the paper never anchors selection to a single
+  position. v1's decision-position anchor (inherited from
+  `GuardrailLens.readout()`'s own default) is cheaper but has a coverage gap:
+  a concept active early in the prompt but evicted from the J-space before
+  the decision position (§4.2's eviction dynamics — unrelated concepts get
+  displaced quickly) never enters the candidate set at all. Recomputing the
+  top-`k=10` at every position closes that gap.
+- **Ablation moved from a handful of selected candidates/onset-spans to
+  every position of the prompt, each tested in isolation.** The intermediate
+  "onset map + persistence span" design (candidates selected once near the
+  decision position, then only their first-crossing position and persistence
+  span tested) is dropped as a *pre-filter*. It fixed the decision-position
+  coverage gap but introduced a new one: whichever position first crosses
+  the activation threshold for a concept gets all the attribution credit,
+  even when a later position — possibly a stronger, MLP-amplified copy per
+  §4.3's broadcast mechanism — is the one actually causally load-bearing.
+  Testing every position independently removes that bias entirely, at the
+  cost of `O(n_positions)` forward passes instead of `O(k)`.
+- **One uniform test for every case (TP/FP/FN/TN) — group ablation only, no
+  `steer`.** v1's case-dependent battery (ablate to test *necessity* on
+  TP/FP, `steer` to test *sufficiency* on FN/TN) answers two different
+  questions. Per-token importance in the decision that was **actually
+  made** is a necessity question only; `steer` tests a hypothetical ("what
+  if this concept had been present"), which isn't what a per-token
+  attribution map needs. `TP`/`FP`/`FN`/`TN` is still useful, but now only
+  as a **lens for interpreting** the resulting scores after the fact, never
+  as a rule for choosing which intervention to run.
+- **The output is a signed, per-token score, not a flip-rate/KL table.**
+  Because one test runs everywhere, the direction of the effect (toward
+  `malign` or toward `benign`) can be read straight from the sign, without
+  needing the case label up front.
+
+**Pipeline:**
+
+```
+ENTRADA: prompt renderizado, posições de p_inicio (pulando SKIP_FIRST_N_POSITIONS,
+         igual ao fitting.py) até p_fim = len(input_ids)-1 (nunca em token gerado)
+
+FASE 0 — leitura completa (read-only)
+  classify(prompt) ─► veredito_limpo, P_limpo(malign)
+  readout em TODAS as posições × TODAS as camadas L13–27
+        (mais caro que o v1 — é próximo do que vis.compute_slice já faz
+         na primeira passada, sem precisar da segunda passada de rank-tracking)
+        │
+        ▼
+  para cada posição p: agrega os scores de ativação através de L13–27
+  e pega os k=10 tokens mais ativos ali → candidatos_p
+  (pula qualquer token que já esteja no top-10 da saída do pass limpo —
+   guarda anti-confound do §3.5.2)
+
+FASE 1 — ablação em grupo, posição a posição (iterativo, sem onset/span)
+  para cada posição p (todas, sequencialmente):
+    ablate_span(candidatos_p) em TODAS as camadas L13–27, SÓ em p → P_ablate(p)
+    ablate_span(k direções aleatórias, mesma norma) em L13–27, SÓ em p → P_controle(p)
+    nota(p) = P_ablate(p) − P_controle(p)
+
+FASE 2 — agregação
+  ranking denso: todas as posições do prompt, ordenadas por nota(p)
+  (opcional: agrupar posições vizinhas com nota parecida em "eventos" —
+   é aqui que onset/span reaparece, só que como resumo, não como filtro)
+```
+
+**Input/generation boundary invariant (unchanged from earlier design
+discussion, still load-bearing here).** The sweep in Fase 0/1 must never
+touch a position at or beyond `len(rendered_prompt_input_ids)` — a decoder
+has no structural distinction between "prompt" and "the model's own
+generated tokens," so a concept whose onset falls past that boundary was not
+caused by anything external; it's the model's own reasoning/narration
+in-progress. Currently a non-issue for the guardrail's `classify()` call
+specifically (thinking disabled, `readout`/`readout_multi` already operate
+on a single un-generated forward pass), but must stay an explicit, checked
+bound (`assert p < len(rendered_prompt_input_ids)`) if any future preset
+enables thinking, or this gets reused on the `TargetModel`'s open-ended
+output.
+
+**The anti-confound guard, precisely.** At each position `p`, before
+ablating, compare `candidatos_p` (from the J-lens readout) against the
+**model's own actual next-token top-10 prediction at that same position**
+(from the ordinary, un-lensed forward pass — not the lens readout) and
+exclude any overlap. Without this, ablating a candidate that's already the
+literal word the model is about to say next is tautological: near the
+decision position the J-lens readout and the model's own prediction
+converge (§A.6: "In the final few layers, all three [lens] methods collapse
+together... converging on surfacing the model's next-token prediction"), so
+ablating e.g. `malign` right before the model outputs `malign` trivially
+crashes `P(malign)` without showing anything about internal reasoning. The
+guard is evaluated at **every** position, not hardcoded to the decision
+point — it is *near-guaranteed* to exclude something right at the decision
+position (predicting the verdict word is literally the model's job there),
+and *can* also fire at other positions whenever the literal next word of the
+underlying text happens to coincide with an active candidate (e.g. a seed
+whose text itself contains the word "illegal" as a natural continuation),
+independent of the classification computation.
+
+**Matched-norm random-direction control, precisely.** Reused from v1
+unchanged, restated here since it is now computed per-position rather than
+per-span: compute `‖Δ_ablate‖`, the norm of the residual-stream change
+induced by ablating `candidatos_p`; construct a perturbation along `k`
+random (non-J-lens) directions, scaled so its induced change has the
+**same norm**; run that instead, measure `P_controle(p)`. This isolates
+"this specific content mattered" from "any equal-sized disturbance here
+would have mattered." §3.5.2/Figure 22 and §A.23/Figure 86 are the source;
+Figure 86 also lists two stronger control flavors not used here — dampening
+the top-aligned SAE decoder directions, and shrinking the non-J-space
+component — both drawn from the model's actual activation manifold rather
+than an arbitrary random direction, and therefore a harder bar to clear. A
+plain random-Gaussian control (what's used here) is the simplest, and
+possibly the weakest, of the paper's own control battery; upgrading to one
+of the stronger variants is a candidate refinement, not yet planned.
+
+**The signed score.**
+
+```
+nota(p) = P_ablate(p)(malign) − P_controle(p)(malign)
+```
+
+Sign convention: **negative** → removing `p`'s content *reduced* `P(malign)`
+more than the matched-norm control did → that content was **supporting the
+malign verdict**. **Positive** → removing it *increased* `P(malign)` beyond
+the control → that content was **suppressing malign** (an exculpatory/
+mitigating token). Near zero → neutral. This single test, run identically
+regardless of the prompt's true label or the guardrail's verdict, is what
+lets `TP`/`FP`/`FN`/`TN` be read as an interpretive lens afterward instead
+of a branch in the pipeline:
+
+| Case | Expected score pattern |
+|---|---|
+| TP | Some strongly negative scores — real harm content drove the block |
+| FP | The most negative score(s) point at exactly the spurious trigger |
+| FN | Weakly negative scores possible (partial, insufficient recognition) or all near zero (nothing registered) — both are distinct, informative findings |
+| TN | Scores near zero throughout; an isolated positive score would indicate content actively reinforcing the correct benign call |
+
+**Provenance — what's from §3.5.2 verbatim vs. this session's synthesis:**
+
+| Piece | Source |
+|---|---|
+| Group ablation of top-`k=10` most active vectors, per position, across a layer band | §3.5.2, verbatim |
+| Anti-confound guard (exclude tokens already in the clean pass's own top-10 output) | §3.5.2, verbatim |
+| Matched-norm random-direction control | §3.5.2 / Figure 22 / §A.23 (Figure 86), verbatim |
+| Running the ablation **isolated, one forward pass per position** (rather than all positions ablated together in one pass, which is what §3.5.2 literally does to measure aggregate capability degradation) | This session's synthesis — closer to the *activation patching* / *causal tracing* tradition (Meng et al., "Locating and Editing Factual Associations in GPT") than to §3.5.2's own experimental design |
+| The signed, class-directional score (`negative`=malign, `positive`=benign) | This session's synthesis — the paper's own causal metrics (KL, flip rate, §A.6) are magnitude-only, never directional; this borrows the signed-contribution convention from general ML feature-attribution methods (SHAP, integrated gradients), not from Gurnee et al. |
+| §A.24.1 "Mechanistic Localization" (layer-onset + layer-sweep patching, confirming causal load-bearing concentrates at a specific *layer*) | Read and considered, **not adopted** — this design ablates the whole `L13–27` band per position rather than localizing to a specific layer, a deliberate simplicity/cost trade-off (layer-band width does not add forward passes; a layer sweep would). Flagged as the more paper-validated alternative if finer layer localization is wanted later. |
+
+**Known limitation this design accepts: no visibility into inter-position
+synergy.** Testing positions in isolation (everything else left clean) can
+miss cases where two positions only matter *jointly* — e.g. if "nerve" and
+"agent" together carry a danger signal that neither carries alone, ablating
+each separately (with the other intact) may show a weak individual effect
+even though jointly ablating both would show a large one. §3.5.2's own
+global, all-positions-at-once ablation does not have this blind spot (it
+never leaves anything "clean" to compensate), but also can't attribute
+effect to any single position — this is the direct trade-off of gaining
+per-position attribution.
+
+**Known limitation this design accepts: no per-concept attribution within a
+position.** Group ablation removes `candidatos_p` together as one
+intervention; if a position's top-10 mixes a malign-supporting and a
+benign-supporting concept, the reported score is their *net* effect, not
+either one individually. v1's leave-one-out (ablating each of the k=10
+individually) gave that finer granularity at `k×` the cost. A cost-bounded
+way to recover it here: run leave-one-out only on the positions with the
+largest `|nota(p)|` after Fase 2, not on every position.
+
+**Cost.** Grows from v1's `~k+5` passes/prompt to `~2 × n_positions`
+passes/prompt (ablate + control, once per position) — for a rendered prompt
+of ~100–300 tokens, roughly 200–600 extra forward passes per prompt. Fase 0
+is also costlier than v1's single-layer onset read: it's closer to
+`vis.compute_slice`'s first pass (top-K per cell across every position and
+every layer of the band) than to a single `apply()` call. Passes remain
+forward-only (no backward/autograd), but with `n_positions` this large, an
+empirical timing calibration on a handful of real prompts is needed before
+projecting corpus-scale wall-clock — no absolute number is asserted here.
+
+**Planned output — `causal_position_scores_<attack>.jsonl`** (replaces v1's
+sparse `causal_attribution_<attack>.jsonl`; one row per `(pool_index,
+position)`, dense — every swept position gets a row, not just onset ones):
+
+```json
+{"pool_index": 42, "position": 6, "token": "nerve", "candidatos": ["harmful","illegal","danger"], "P_ablate": 0.55, "P_controle": 0.91, "nota": 0.36, "kl": 1.12}
+```
+
+`causal_readouts_<attack>.jsonl` and `causal_summary_<attack>.csv` from v1's
+planned output remain useful unchanged (clean-pass verdict/case-labeling,
+and case-aggregated statistics respectively) — only the intervention-level
+file changes shape, from sparse per-onset to dense per-position.
 
 ## Data flow (Phase 2, current state)
 
@@ -307,9 +642,6 @@ guardrail_eval/
 ├── ground_truth.py           # Phase 3: Strategy-A claims (label x verdict -> expected answer)
 ├── audit_agent.py            # Phase 3: investigator (DeepSeek) + judge (Groq gpt-oss-120b) (format_readout/investigate/judge)
 ├── run_audit_pipeline.py     # Phase 3: auditor driver (guardrail + lens + investigator + judge)
-├── interventions.py          # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap + InterventionHook (write-capable)
-├── tests/
-│   └── test_interventions.py # 10 invariant tests vs TinyDecoder (standalone script; no pytest in venv)
 ├── setup_pod.sh              # Phase 3: idempotent pod setup (matched-index torch/torchvision/torchaudio fix + installs)
 ├── make_slices.py            # jlens.vis.compute_slice pages for selected rows (see VISUALIZATION.md)
 ├── make_report.py            # static XAI report (MD + PDF) over an audit run (see VISUALIZATION.md)
@@ -329,6 +661,13 @@ guardrail_eval/
     ├── audit_scores_baseline[_wrapping].jsonl     # per (prompt, claim): investigator verdict + judge scores
     ├── audit_summary_baseline[_wrapping].csv      # per-claim aggregate + investigator accuracy
     └── audit_summary_combined.csv                 # cross-attack aggregate (only when --attack both)
+
+causal_eval/                     # root-level sibling of guardrail_eval/ (causal validation pipeline v2)
+├── interventions.py             # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap + InterventionHook (write-capable) — moved here from guardrail_eval/
+├── causal_sweep.py              # v2 pipeline orchestration; Fase 0 `position_candidates` implemented so far
+└── tests/
+    ├── test_interventions.py    # 10 invariant tests vs TinyDecoder (moved here; standalone script, reuses guardrail_eval/.venv)
+    └── test_causal_sweep.py     # v2 tests; first test (candidate selection) so far
 ```
 
 ## What's validated so far (smoke tests only — nothing run at full scale)
@@ -350,9 +689,12 @@ guardrail_eval/
     into completing the persona's roleplay text instead of emitting a
     clean verdict. This is a real signal about wrapping attacks degrading
     guardrail output reliability, not a pipeline bug.
-- Interventions: 10/10 invariant tests pass for `interventions.py`
+- Interventions: 10/10 invariant tests pass for `causal_eval/interventions.py`
   (steer/ablate/swap + write hook) against `TinyDecoder` — mechanical
   correctness only, no semantic/causal validation yet (needs Qwen3).
+- Causal v2 Fase 0: 1/1 test passes for `causal_eval/causal_sweep.py`'s
+  `position_candidates` (candidate selection returns exactly `k` distinct
+  in-range token ids against `TinyDecoder`) — again mechanical only.
 
 ## Not yet built (explicitly out of scope so far)
 
@@ -365,12 +707,16 @@ guardrail_eval/
   `jlens.vis.compute_slice`, but that stays a separate, selective step —
   running it over a full corpus is still deferred for cost reasons.
 - No causal validation of the lens *on the guardrail*. The mechanical
-  primitives now exist (`interventions.py`, invariant-tested — see "Causal
-  interventions" above), but they have not been *run on Qwen3* to show that
-  ablating/swapping the surfaced concepts actually changes the guardrail's
-  verdict. Everything scored so far is read-only interpretability; the causal
-  claim (and the auditor's "Strategy B" ground truth: ablation-KL + swap
-  success, §A.6) is still pending.
+  primitives exist (`causal_eval/interventions.py`, invariant-tested), and the
+  v2 pipeline's Fase 0 candidate selection is now coded and tested
+  (`causal_eval/causal_sweep.py`), but the rest of v2 (anti-confound guard,
+  matched-norm control, per-position ablation sweep, signed score, the
+  `run_causal_pipeline.py` driver, and `results_causal/`) is still unwritten,
+  and nothing has been *run on Qwen3* to show that ablating the surfaced
+  concepts actually changes the guardrail's verdict. Everything scored so far
+  is read-only interpretability; the causal claim (and the auditor's
+  "Strategy B" ground truth: ablation-KL + swap success, §A.6) is still
+  pending.
 - No LLM-judge / attack-success-rate scoring of target outputs — the
   target results are raw completions only, not yet graded.
 - Full-corpus runs (all 230 seeds × 2 attacks) — everything to date is a
