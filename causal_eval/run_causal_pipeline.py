@@ -186,9 +186,10 @@ def run_attack(gl: GuardrailLens, attack: str, args: argparse.Namespace) -> None
             fr.flush()
             for rec in records:
                 token = gl.tok.decode([int(input_ids[0, rec["position"]])])
+                candidatos = [gl.tok.decode([cid]) for cid in rec["candidate_ids"]]
                 fs.write(json.dumps({
                     "pool_index": pool_index, "attack": attack, "case": case,
-                    "token": token, **rec,
+                    "token": token, "candidatos": candidatos, **rec,
                 }) + "\n")
             fs.flush()
 
@@ -204,7 +205,9 @@ def run_attack(gl: GuardrailLens, attack: str, args: argparse.Namespace) -> None
                        f"->{verdict} ({case}) | {timing}")
                 if top is not None:
                     tt = gl.tok.decode([int(input_ids[0, top['position']])])
-                    msg += f"\n    most malign-driving: {tt!r} @ {top['position']} (nota={top['nota']:.4f})"
+                    top_cands = [gl.tok.decode([cid]) for cid in top["candidate_ids"]]
+                    msg += (f"\n    most malign-driving: {tt!r} @ {top['position']} "
+                            f"(nota={top['nota']:.4f}); candidatos: {top_cands}")
                 print(msg)
             else:
                 print(f"[{attack}] pool_index={pool_index}: {timing}")

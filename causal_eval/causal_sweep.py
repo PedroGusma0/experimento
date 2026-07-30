@@ -202,8 +202,12 @@ def sweep_positions(
 
     Returns:
         A list of dicts (ascending position), each with ``position``,
-        ``n_candidates``, ``score_ablate``, ``score_control``, ``nota``,
-        and ``kl_ablate``/``kl_control`` — ``KL(clean ‖ intervened)`` on the
+        ``n_candidates``, ``candidate_ids`` (the ``k`` vocabulary token ids
+        actually ablated at this position — raw ids, not decoded strings,
+        since this function is model/tokenizer-agnostic; the caller decodes
+        them, same as it already decodes the swept position's own token),
+        ``score_ablate``, ``score_control``, ``nota``, and
+        ``kl_ablate``/``kl_control`` — ``KL(clean ‖ intervened)`` on the
         full next-token distribution at ``decision_position`` (§A.6's
         "ablation effect" metric, computed for both the real ablation and its
         matched-norm control, so a control-adjusted KL is available as
@@ -265,6 +269,7 @@ def sweep_positions(
                 {
                     "position": p,
                     "n_candidates": len(cands),
+                    "candidate_ids": cands,
                     "score_clean": score_clean,
                     "score_ablate": score_ablate,
                     "score_control": score_control,

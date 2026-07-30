@@ -189,6 +189,12 @@ def test_sweep_returns_one_signed_record_per_swept_position():
         for key in ("score_clean", "score_ablate", "score_control"):
             assert 0.0 <= r[key] <= 1.0  # probabilities
         assert r["n_candidates"] == 6
+        # candidate_ids: the actual k tokens ablated at this position -- raw
+        # ids (model-agnostic; the driver decodes them for the real guardrail)
+        assert isinstance(r["candidate_ids"], list)
+        assert len(r["candidate_ids"]) == 6
+        vocab = model.lm_head.out_features
+        assert all(isinstance(t, int) and 0 <= t < vocab for t in r["candidate_ids"])
         # KL(clean ‖ intervened) — §A.6's own causal metric, always >= 0
         for key in ("kl_ablate", "kl_control"):
             assert torch.isfinite(torch.tensor(r[key]))
