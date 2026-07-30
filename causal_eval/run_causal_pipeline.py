@@ -96,12 +96,22 @@ def run_attack(gl: GuardrailLens, attack: str, args: argparse.Namespace) -> None
 
     band = [l for l in gl.lens.source_layers if args.layer_lo <= l <= args.layer_hi]
     malign_id = gl.tok.encode("malign", add_special_tokens=False)[0]
+    benign_id = gl.tok.encode("benign", add_special_tokens=False)[0]
 
     def run_forward(input_ids):
         return gl.hf(input_ids).logits[0]  # [seq_len, vocab]
 
-    def score_fn(logits):  # P(malign) at the decision position
-        return float(torch.softmax(logits.float(), dim=-1)[malign_id])
+    def score_fn(logits):
+        # log-odds(malign vs benign) at the decision position, not raw
+        # P(malign): softmax saturates near 1.0 for this guardrail (both TP
+        # and FP prompts in the first real run hit P(malign)~1.0), hiding all
+        # but the single largest effect below float32 noise. logit_malign -
+        # logit_benign stays sensitive in that regime and, unlike a bare
+        # logit_malign, is invariant to any shared shift across all logits
+        # (e.g. the ablation making the model generally less confident) --
+        # the log-sum-exp normalizer cancels exactly in the subtraction.
+        logits = logits.float()
+        return float(logits[malign_id] - logits[benign_id])
 
     os.makedirs(_OUT_DIR, exist_ok=True)
     slug = _slug(attack)
@@ -128,9 +138,29 @@ def run_attack(gl: GuardrailLens, attack: str, args: argparse.Namespace) -> None
             verdict, _ = gl.classify(prompt)
             case = _case(row["label"], verdict)
 
-            p_start = None
+            # p_start: skip past the fixed system prompt + "INPUT: " boilerplate
+            # dynamically, per prompt -- not SKIP_FIRST_N_POSITIONS (that constant
+            # is jlens.fitting's attention-sink skip, unrelated; reusing it left
+            # the sweep deep inside SYSTEM_PROMPT, which is identical across every
+            # prompt and therefore cannot explain any one prompt's verdict; see
+            # ARCHITECTURE.md, "First real-guardrail run...", Finding 4). Locate
+            # where the seed text begins in the rendered string and tokenize only
+            # that prefix. p_end is NOT given the equivalent treatment: trailing
+            # boilerplate (Classification:/<think></think>/etc.) comes AFTER the
+            # seed, so causal attention lets it legitimately carry seed-derived
+            # signal even though its surface tokens are fixed.
+            seed_text = row["prompt"]
+            try:
+                prefix_end = prompt.index(seed_text)
+                seed_start = int(gl.model.encode(prompt[:prefix_end]).shape[1])
+            except ValueError:
+                seed_start = 16  # SKIP_FIRST_N_POSITIONS fallback: seed not found
+                print(f"  [warn] pool_index={pool_index}: seed text not found "
+                      f"verbatim in rendered prompt, falling back to p_start=16")
+
+            p_start = seed_start
             if args.last_n is not None:
-                p_start = max(16, seq_len - args.last_n)  # 16 = SKIP_FIRST_N_POSITIONS
+                p_start = max(seed_start, seq_len - args.last_n)
 
             records = sweep_positions(
                 gl.model.layers, gl.lens, gl.hf.get_output_embeddings().weight,

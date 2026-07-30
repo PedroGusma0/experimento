@@ -41,7 +41,8 @@ from jlens.fitting import fit  # noqa: E402
 from jlens.hooks import ActivationRecorder  # noqa: E402
 from tests.tiny import TinyDecoder  # noqa: E402
 
-from causal_sweep import position_candidates, sweep_positions  # noqa: E402
+from causal_sweep import _kl_divergence, position_candidates, sweep_positions  # noqa: E402
+from interventions import lens_vectors  # noqa: E402
 
 _PROMPT = "abcdefghij " * 5  # > SKIP_FIRST_N_POSITIONS tokens
 _BAND = [0, 1, 2]  # TinyDecoder's fitted layers stand in for the workspace band
@@ -78,6 +79,27 @@ def test_candidates_are_k_tokens():
     assert all(0 <= t < vocab for t in cands)  # in vocabulary range
 
 
+def test_position_candidates_reuses_precomputed_V_by_layer():
+    """Passing V_by_layer must give identical results to internal
+    recomputation -- this is the fix for the redundant lens_vectors
+    recomputation found to dominate real-guardrail wall-clock cost (~13x the
+    cost of the actual forward passes, per ARCHITECTURE.md's "First
+    real-guardrail run and three findings", Finding 2). sweep_positions now
+    passes its precomputed V_all here instead of letting each position
+    recompute lens_vectors from scratch."""
+    model, lens, acts = _model_lens_residuals()
+    residual_by_layer = {layer: acts[layer][0, 20] for layer in _BAND}
+    W_U = model.lm_head.weight
+
+    baseline = position_candidates(lens, W_U, residual_by_layer, k=10)
+
+    V_by_layer = {layer: lens_vectors(lens, W_U, layer) for layer in _BAND}
+    with_precomputed = position_candidates(
+        lens, W_U, residual_by_layer, k=10, V_by_layer=V_by_layer
+    )
+    assert with_precomputed == baseline
+
+
 def test_exclude_removes_given_tokens_and_backfills():
     """The anti-confound guard mechanism (§3.5.2): tokens passed via `exclude`
     never appear in the result, and the next-highest-scoring tokens take their
@@ -112,6 +134,21 @@ def test_exclude_raises_when_k_exceeds_selectable():
         raise AssertionError("expected ValueError, none raised")
     except ValueError:
         pass
+
+
+def test_kl_divergence_is_zero_for_identical_logits():
+    torch.manual_seed(40)
+    logits = torch.randn(32)
+    assert abs(_kl_divergence(logits, logits)) < 1e-5
+
+
+def test_kl_divergence_is_nonnegative_and_asymmetric():
+    torch.manual_seed(41)
+    p, q = torch.randn(32), torch.randn(32)
+    kl_pq = _kl_divergence(p, q)
+    kl_qp = _kl_divergence(q, p)
+    assert kl_pq >= -1e-6 and kl_qp >= -1e-6  # KL >= 0 (float slack)
+    assert kl_pq != kl_qp  # KL is not symmetric in general
 
 
 def _tiny_sweep_callables(model):
@@ -152,6 +189,10 @@ def test_sweep_returns_one_signed_record_per_swept_position():
         for key in ("score_clean", "score_ablate", "score_control"):
             assert 0.0 <= r[key] <= 1.0  # probabilities
         assert r["n_candidates"] == 6
+        # KL(clean ‖ intervened) — §A.6's own causal metric, always >= 0
+        for key in ("kl_ablate", "kl_control"):
+            assert torch.isfinite(torch.tensor(r[key]))
+            assert r[key] >= -1e-5  # KL divergence is non-negative (float slack)
 
 
 def test_sweep_respects_explicit_position_window():

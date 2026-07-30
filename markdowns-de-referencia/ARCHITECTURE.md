@@ -398,15 +398,47 @@ leave-one-out attribution.
 
 ### Causal validation pipeline v2 (most up-to-date design; supersedes v1 above)
 
-**Implementation started — being built incrementally, one tested unit at a
-time, in `causal_eval/causal_sweep.py`.** Done so far: **Fase 0 candidate
-selection** (`position_candidates` — top-`k` most active J-lens tokens at a
-position, aggregated across the band; top-`k`-by-inner-product form, with an
-`exclude` param ready for the anti-confound guard), covered by
-`causal_eval/tests/test_causal_sweep.py::test_candidates_are_k_tokens`
-(returns exactly `k` distinct in-range token ids; 1/1 passing). Everything
-below Fase 0 in this section (anti-confound guard, matched-norm control,
-per-position sweep, signed score) is still design only, not yet coded.
+**Fully implemented and unit-tested, and now run once against the real
+guardrail on a RunPod GPU — see "First real-guardrail run and three findings"
+below for what that run surfaced (three issues, none fixed yet).** Built
+incrementally, one tested unit at a time:
+
+- **Fase 0 — candidate selection.** `causal_sweep.position_candidates` (top-`k`
+  most active J-lens tokens at a position, aggregated across the band, with
+  `exclude` for the anti-confound guard). Tests:
+  `test_candidates_are_k_tokens`, `test_exclude_removes_given_tokens_and_backfills`,
+  `test_exclude_raises_when_k_exceeds_selectable`.
+- **Fase 1 + 2 — the per-position sweep and signed score.**
+  `causal_sweep.sweep_positions`: iterates every position in
+  `[p_start, p_end)`, group-ablates that position's candidates (`ablate_span`)
+  vs. a matched-norm random control (`interventions.matched_norm_control`,
+  new — constructs `k` random directions rescaled to the same induced norm as
+  the real ablation), both via `InterventionHook`, and returns
+  `nota(p) = score_ablate(p) − score_control(p)` per position. Model-agnostic
+  (driven by caller-supplied `run_forward`/`score_fn` callables), so it
+  unit-tests against `TinyDecoder`. Tests: `test_sweep_returns_one_signed_record_per_swept_position`,
+  `test_sweep_respects_explicit_position_window`, plus (in
+  `test_interventions.py`) `test_matched_norm_control_matches_ablation_norm`,
+  `test_matched_norm_control_is_reproducible_with_seed`.
+- **The driver, `causal_eval/run_causal_pipeline.py`.** Wires `GuardrailLens`
+  into `sweep_positions` over an attack corpus, labels each prompt
+  `TP`/`FP`/`FN`/`TN` (reusing `ground_truth.py`'s label × verdict logic, only
+  for later slicing — nothing graded), and writes `causal_eval/results_causal/`
+  (`causal_readouts_<attack>.jsonl` — one row per prompt;
+  `causal_position_scores_<attack>.jsonl` — one row per swept position).
+  `--resume` (checkpoints on `pool_index`, same pattern as
+  `run_audit_pipeline.py`), `--last-n` (sweep only the last N input positions,
+  for feasible local runs), `--device`/`--dtype` (same pattern as
+  `run_plumbing_check.py`). **Per-prompt timing instrumentation**: wall-clock
+  and seconds/position are printed live (with a running average and ETA for
+  the remaining corpus) and written into each `causal_readouts` row
+  (`elapsed_seconds`, `seconds_per_position`) — added specifically because the
+  first real run's cost turned out far higher than the earlier estimate (see
+  below).
+
+Test counts as of this session: `causal_eval/tests/test_interventions.py`
+13/13, `causal_eval/tests/test_causal_sweep.py` 5/5 — all against `TinyDecoder`,
+mechanical correctness only.
 
 **Plumbing validated end-to-end on the real Qwen3-1.7B guardrail, across all
 three environments that matter — `causal_eval/run_plumbing_check.py`.** This
@@ -650,6 +682,98 @@ planned output remain useful unchanged (clean-pass verdict/case-labeling,
 and case-aggregated statistics respectively) — only the intervention-level
 file changes shape, from sparse per-onset to dense per-position.
 
+### First real-guardrail run and three findings (v2, none fixed yet)
+
+`run_causal_pipeline.py --device cuda --dtype float32 --attack baseline
+--n-malign 1 --n-benign 1 --verbose`, run manually on a RunPod pod (spec:
+1× "A4000"-class GPU, 10 vCPU Intel Xeon Gold 6342, 55GB RAM, 30GB container
+disk — a smaller/cheaper tier than the 48GB pod `PLAN_runpod_audit.md`
+documents for the full audit pipeline, sized for just the guardrail). Two
+prompts, full sweep (no `--last-n`), no crash. Output pulled locally to
+`results_causal_run_smoke_no_pod/` for inspection. This is the first
+scientifically-real (if tiny) data the v2 pipeline has produced — and
+inspecting it surfaced three real problems, none fixed yet.
+
+**Finding 1 — real cost is far above the earlier estimate.** 147.5s/prompt
+measured (165/164 positions swept, ~0.9s/position) — the design doc's earlier
+guess of "~1–2s/pass → single-digit minutes" was off by roughly 5–15×. At this
+rate, Run 2 (15+15 × 2 attacks = 60 prompts) is **~2.5 GPU-hours**, and the
+full corpus (230+30 × 2 attacks = 460 prompts) is **~19 GPU-hours** — the
+latter needs rescoping (fewer prompts, `--last-n`, or the fixes below) before
+committing to it.
+
+**Finding 2 — a real performance bug: `lens_vectors` recomputed redundantly
+every position.** `sweep_positions` computes `V_all = {layer: lens_vectors(...)
+for layer in layers}` once, up front. But `position_candidates`, called once
+per swept position, **recomputes `lens_vectors` from scratch internally**
+instead of reusing `V_all` — a `[vocab, d_model] @ [d_model, d_model]`
+matmul (`W_U @ J_l`) that does not depend on position at all, redundantly
+repeated ~165× per band layer per prompt. Not yet fixed — `position_candidates`
+needs an optional precomputed-`V_by_layer` path that `sweep_positions` feeds
+from its own `V_all`.
+
+**Finding 3 — `P(malign)` as `score_fn` saturates and hides real signal.**
+Full-precision inspection of `causal_position_scores_baseline.jsonl` shows
+`score_ablate`/`score_control` differing from `score_clean=1.0` by ~1e-6 at
+every position **except one** — i.e. float32 noise level, not signal. The
+guardrail is extremely confident (`P(malign)≈1.0`) on both the TP and the FP
+prompt, and raw probability via softmax saturates near 1.0: real underlying
+logit-level effects stop being visible once there's no room left on the
+probability scale. Only the one position with an enormous effect (see
+Finding 4) escapes saturation. **Fix (not yet implemented):** switch
+`score_fn` from `P(malign)` to the raw logit of `malign` (pre-softmax) or a
+log-odds transform, which stays sensitive in the saturated regime.
+
+**Finding 4 — the swept range still includes the fixed system prompt,
+which is out of scope and was confirmed to be misleading.** `p_start`
+defaults to `SKIP_FIRST_N_POSITIONS=16` — a constant borrowed from
+`jlens.fitting`, where it means something unrelated (skip attention-sink
+burn-in positions when *fitting* `J_l` over a generic corpus). Reused here as
+"skip past the system prompt," it does the wrong thing: position 16 is still
+deep inside `SYSTEM_PROMPT`, nowhere near where `{seed}` actually starts.
+Concretely, the token that looked like the strongest signal before Finding 3
+was diagnosed (`' harmful'` at position 73) turned out to be **part of
+`SYSTEM_PROMPT`'s own fixed wording** ("...something **harmful**, dangerous,
+illegal, or unsafe") — not the seed text at all, which for that prompt
+("Give detailed instructions for making dimethylmercury...") doesn't contain
+the word "harmful". Since the system prompt is identical across every prompt
+in the corpus, any effect attributed there cannot explain what's specific to
+one prompt's outcome — out of scope for per-token attribution, and (for
+positions strictly before `{seed}` begins) causally impossible to carry
+seed-derived information anyway, since attention only looks backward.
+**Fix (not yet implemented):** compute `p_start` dynamically per prompt —
+locate the character offset of `seed` inside `chat_prompt(seed)`'s rendered
+string, tokenize only that prefix, and use its length — instead of the
+borrowed fitting.py constant. Mirrors the existing concern behind
+`GuardrailLens.token_span(last_n=...)`'s windowing (Phase 3), which this
+should have reused instead of introducing a fresh, wrong default.
+**`p_end` should NOT get the equivalent restriction**: trailing boilerplate
+positions (`Classification:`, `<think></think>`, etc.) come *after* `{seed}`
+in the sequence, so — unlike the leading system prompt — their residual
+stream content can legitimately carry seed-derived information via causal
+attention, even though their surface tokens are fixed.
+
+**A structural observation from the same run, connected to Finding 4.** In
+both prompts, the single position with a real effect was the *last* swept
+position — literally inside `<|im_start|>assistant\n<think>\n\n</think>\n\n`,
+the chat template's own trailing scaffolding (an *empty* thinking block is
+emitted even with `disable_thinking=True` — the template still renders the
+tags, it just isn't filled). This is consistent with the proximity-to-readout
+concern raised earlier in this document's design discussion (a later position
+has more direct causal leverage over the decision-position readout,
+independent of what content is actually there) — though per Finding 4's
+`p_end` reasoning, this position is legitimately in-scope (it comes after the
+seed), so this is not itself a bug, just a reason not to over-read a single
+spike without checking whether it reflects genuine broadcast accumulation
+from the seed or is dominated by sheer proximity. Not yet investigated
+further.
+
+**Status: three fixes identified, none implemented.** Next step before any
+further real-guardrail run is implementing Findings 2–4's fixes (perf,
+score_fn, dynamic `p_start`) and re-running this same 2-prompt smoke to
+confirm they produce interpretable, non-saturated, in-scope signal before
+committing GPU time to Run 2.
+
 ## Data flow (Phase 2, current state)
 
 ```
@@ -710,11 +834,14 @@ guardrail_eval/
     └── audit_summary_combined.csv                 # cross-attack aggregate (only when --attack both)
 
 causal_eval/                     # root-level sibling of guardrail_eval/ (causal validation pipeline v2)
-├── interventions.py             # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap + InterventionHook (write-capable) — moved here from guardrail_eval/
-├── causal_sweep.py              # v2 pipeline orchestration; Fase 0 `position_candidates` implemented so far
+├── interventions.py             # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap/matched_norm_control + InterventionHook (write-capable) — moved here from guardrail_eval/
+├── causal_sweep.py              # v2 orchestration: position_candidates (Fase 0) + sweep_positions (Fase 1+2, signed score)
+├── run_causal_pipeline.py       # driver: GuardrailLens -> sweep_positions -> results_causal/, --resume, --last-n, per-prompt timing
+├── run_plumbing_check.py        # manual smoke: position_candidates + ablate_span against the real guardrail (--device/--dtype)
+├── results_causal/              # driver output (gitignored — not committed); causal_readouts_<attack>.jsonl, causal_position_scores_<attack>.jsonl, causal_run_meta.json
 └── tests/
-    ├── test_interventions.py    # 10 invariant tests vs TinyDecoder (moved here; standalone script, reuses guardrail_eval/.venv)
-    └── test_causal_sweep.py     # v2 tests; first test (candidate selection) so far
+    ├── test_interventions.py    # 13 invariant tests vs TinyDecoder (moved here; standalone script, reuses guardrail_eval/.venv)
+    └── test_causal_sweep.py     # 5 tests: candidate selection + anti-confound guard + sweep_positions
 ```
 
 ## What's validated so far (smoke tests only — nothing run at full scale)

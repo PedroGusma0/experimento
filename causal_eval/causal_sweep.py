@@ -55,6 +55,7 @@ def position_candidates(
     k: int = 10,
     exclude: Iterable[int] | None = None,
     aggregate: str = "max",
+    V_by_layer: Mapping[int, torch.Tensor] | None = None,
 ) -> list[int]:
     """Top-``k`` most active J-lens vocabulary tokens at a single position.
 
@@ -86,6 +87,17 @@ def position_candidates(
             here so a token the model was already about to emit is never
             ablated (§3.5.2).
         aggregate: ``"max"`` (most active anywhere in the band) or ``"mean"``.
+        V_by_layer: Optional precomputed ``{layer: lens_vectors(lens,
+            unembed_weight, layer)}`` (each ``[vocab, d_model]``). Pass this
+            when the caller already has it (e.g. :func:`sweep_positions`,
+            once for the whole sweep) to skip recomputing the ``W_U · J_l``
+            matmul on every call — that matmul (~1.3 TFLOP for Qwen3-1.7B's
+            vocab) dominates wall-clock cost when called once per swept
+            position instead of once per layer; see ARCHITECTURE.md, "First
+            real-guardrail run and three findings", Finding 2. Falls back to
+            computing it internally via ``lens``/``unembed_weight`` when
+            omitted (unchanged behavior, still correct — just redundant at
+            scale).
 
     Returns:
         A list of ``k`` vocabulary token ids, highest aggregated activation
@@ -103,7 +115,11 @@ def position_candidates(
 
     per_layer = []
     for layer, residual in residual_by_layer.items():
-        V = lens_vectors(lens, unembed_weight, layer)  # [vocab, d_model]
+        V = (
+            V_by_layer[layer]
+            if V_by_layer is not None
+            else lens_vectors(lens, unembed_weight, layer)
+        )  # [vocab, d_model]
         h = residual.to(V.dtype).to(V.device)
         per_layer.append(V @ h)  # [vocab] = ⟨v_t, h_l⟩ for every token t
     scores = torch.stack(per_layer, dim=0)  # [n_band_layers, vocab]
@@ -186,9 +202,13 @@ def sweep_positions(
 
     Returns:
         A list of dicts (ascending position), each with ``position``,
-        ``n_candidates``, ``score_ablate``, ``score_control``, and ``nota``.
-        ``score_clean`` (the un-intervened baseline) is attached to every row
-        for reference.
+        ``n_candidates``, ``score_ablate``, ``score_control``, ``nota``,
+        and ``kl_ablate``/``kl_control`` — ``KL(clean ‖ intervened)`` on the
+        full next-token distribution at ``decision_position`` (§A.6's
+        "ablation effect" metric, computed for both the real ablation and its
+        matched-norm control, so a control-adjusted KL is available as
+        ``kl_ablate - kl_control`` if wanted). ``score_clean`` (the
+        un-intervened baseline) is attached to every row for reference.
     """
     seq_len = int(input_ids.shape[1])
     if p_start is None:
@@ -209,7 +229,8 @@ def sweep_positions(
             residuals = {
                 layer: rec.activations[layer][0].detach() for layer in layers
             }
-        score_clean = score_fn(clean_logits[decision_position])
+        clean_logits_dp = clean_logits[decision_position]
+        score_clean = score_fn(clean_logits_dp)
 
         results: list[dict] = []
         for p in range(p_start, p_end):
@@ -217,7 +238,7 @@ def sweep_positions(
             guard = clean_logits[p].topk(guard_top_n).indices.tolist()
             cands = position_candidates(
                 lens, unembed_weight, residual_by_layer,
-                k=k, exclude=guard, aggregate=aggregate,
+                k=k, exclude=guard, aggregate=aggregate, V_by_layer=V_all,
             )
             V = {layer: V_all[layer][cands].T for layer in layers}  # [d_model, k]
 
@@ -225,7 +246,9 @@ def sweep_positions(
                 layer: (lambda x, V=V[layer]: ablate_span(x, V)) for layer in layers
             }
             with InterventionHook(blocks, ablate_edits, positions=[p]):
-                score_ablate = score_fn(run_forward(input_ids)[decision_position])
+                ablate_logits_dp = run_forward(input_ids)[decision_position]
+            score_ablate = score_fn(ablate_logits_dp)
+            kl_ablate = _kl_divergence(clean_logits_dp, ablate_logits_dp)
 
             control_edits = {
                 layer: (
@@ -234,7 +257,9 @@ def sweep_positions(
                 for layer in layers
             }
             with InterventionHook(blocks, control_edits, positions=[p]):
-                score_control = score_fn(run_forward(input_ids)[decision_position])
+                control_logits_dp = run_forward(input_ids)[decision_position]
+            score_control = score_fn(control_logits_dp)
+            kl_control = _kl_divergence(clean_logits_dp, control_logits_dp)
 
             results.append(
                 {
@@ -244,6 +269,20 @@ def sweep_positions(
                     "score_ablate": score_ablate,
                     "score_control": score_control,
                     "nota": score_ablate - score_control,
+                    "kl_ablate": kl_ablate,
+                    "kl_control": kl_control,
                 }
             )
     return results
+
+
+def _kl_divergence(p_logits: torch.Tensor, q_logits: torch.Tensor) -> float:
+    """``KL(P ‖ Q)`` between two next-token distributions given as raw
+    (pre-softmax) logits — the paper's own "ablation effect" metric (§A.6):
+    "we take its vector for the intermediate token... and record the KL
+    divergence this induces on the model's output." Computed via
+    ``log_softmax`` (not ``softmax`` then ``log``) for numerical stability.
+    """
+    log_p = torch.log_softmax(p_logits.float(), dim=-1)
+    log_q = torch.log_softmax(q_logits.float(), dim=-1)
+    return float((log_p.exp() * (log_p - log_q)).sum())
