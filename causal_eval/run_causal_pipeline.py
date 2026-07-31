@@ -138,35 +138,46 @@ def run_attack(gl: GuardrailLens, attack: str, args: argparse.Namespace) -> None
             verdict, _ = gl.classify(prompt)
             case = _case(row["label"], verdict)
 
-            # p_start: skip past the fixed system prompt + "INPUT: " boilerplate
-            # dynamically, per prompt -- not SKIP_FIRST_N_POSITIONS (that constant
-            # is jlens.fitting's attention-sink skip, unrelated; reusing it left
-            # the sweep deep inside SYSTEM_PROMPT, which is identical across every
-            # prompt and therefore cannot explain any one prompt's verdict; see
-            # ARCHITECTURE.md, "First real-guardrail run...", Finding 4). Locate
-            # where the seed text begins in the rendered string and tokenize only
-            # that prefix. p_end is NOT given the equivalent treatment: trailing
-            # boilerplate (Classification:/<think></think>/etc.) comes AFTER the
-            # seed, so causal attention lets it legitimately carry seed-derived
-            # signal even though its surface tokens are fixed.
+            # p_start/p_end: sweep only the seed's own token span, dynamically
+            # per prompt -- not SKIP_FIRST_N_POSITIONS/seq_len (the former is
+            # jlens.fitting's attention-sink skip, unrelated; the latter would
+            # also sweep the trailing boilerplate). Locate where the seed text
+            # begins and ends in the rendered string and tokenize only up to
+            # each boundary. This used to leave p_end at seq_len on the theory
+            # that causal attention lets the trailing boilerplate (Classification:
+            # /<think></think>/etc.) legitimately carry seed-derived signal --
+            # true for the *causal* question ("does this position matter"), but
+            # that boilerplate is identical across every prompt, so scoring it
+            # answers "what is the model concluding right before it answers",
+            # not "what in the attacker's input drove the verdict" -- the
+            # latter is what this pipeline is for, so only the seed span itself
+            # is now swept/scored (see ARCHITECTURE.md).
             seed_text = row["prompt"]
             try:
-                prefix_end = prompt.index(seed_text)
-                seed_start = int(gl.model.encode(prompt[:prefix_end]).shape[1])
+                prefix_start = prompt.index(seed_text)
+                prefix_end = prefix_start + len(seed_text)
+                seed_start = int(gl.model.encode(prompt[:prefix_start]).shape[1])
+                seed_end = int(gl.model.encode(prompt[:prefix_end]).shape[1])
             except ValueError:
                 seed_start = 16  # SKIP_FIRST_N_POSITIONS fallback: seed not found
+                seed_end = seq_len
                 print(f"  [warn] pool_index={pool_index}: seed text not found "
-                      f"verbatim in rendered prompt, falling back to p_start=16")
+                      f"verbatim in rendered prompt, falling back to "
+                      f"p_start=16, p_end=seq_len")
 
             p_start = seed_start
+            p_end = seed_end
             if args.last_n is not None:
-                p_start = max(seed_start, seq_len - args.last_n)
+                p_start = max(seed_start, p_end - args.last_n)
 
             records = sweep_positions(
                 gl.model.layers, gl.lens, gl.hf.get_output_embeddings().weight,
                 input_ids, run_forward, score_fn,
-                layers=band, k=args.k, p_start=p_start, seed=args.seed,
+                layers=band, k=args.k, p_start=p_start, p_end=p_end, seed=args.seed,
             )
+            if not records:
+                print(f"  [warn] pool_index={pool_index}: 0 positions swept "
+                      f"(p_start={p_start}, p_end={p_end})")
             elapsed = time.perf_counter() - t0
             elapsed_total += elapsed
             n_timed += 1
