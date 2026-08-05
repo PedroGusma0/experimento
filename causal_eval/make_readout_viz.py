@@ -12,12 +12,15 @@ by magnitude -- following the visual-mapping conventions surveyed in
 an independent per-position ablation effect, not a Shapley-style additive
 decomposition, so the page never claims the marks sum to anything.
 
-Deliberately for a **small, selected** set of prompts, not a full corpus --
-mirrors `guardrail_eval/make_slices.py`'s scoping rationale: one page per
-prompt at scale would be 230 pages nobody reads end to end; the value is in
-looking at a handful of well-chosen cases (see `--select` below), not in
-exhaustive coverage. Pure post-processing over already-written JSONL --
-no model load, no GPU, runs in well under a second.
+Deliberately defaults to a **small, selected** set of prompts, not a full
+corpus -- mirrors `guardrail_eval/make_slices.py`'s scoping rationale: the
+value is usually in looking at a handful of well-chosen cases (`--select
+top-per-case`/`pool-index`), not exhaustive coverage. `--select all` opts
+back into the full corpus explicitly (one long page, every prompt as its own
+section -- not 230 separate files) for when full-corpus inspection is
+actually what's wanted, e.g. archiving every prompt of a completed pod run.
+Pure post-processing over already-written JSONL -- no model load, no GPU,
+runs in well under a second even over the full 230-prompt corpus.
 
 Reads `<results-dir>/causal_readouts_<attack>.jsonl` +
 `causal_position_scores_<attack>.jsonl` (written by `run_causal_pipeline.py`;
@@ -32,6 +35,10 @@ Example (after a local or downloaded run_causal_pipeline.py run):
 Example (against the archived Run 2 pod results, specific prompts):
     guardrail_eval/.venv/Scripts/python.exe causal_eval/make_readout_viz.py \
         --results-dir ../run_2_pod --select pool-index --pool-index 48 227 214
+
+Example (archived Run 2 pod results, every prompt in the run):
+    guardrail_eval/.venv/Scripts/python.exe causal_eval/make_readout_viz.py \
+        --results-dir ../run_2_pod --select all --out ../run_2_pod/readout_viz_baseline_full.html
 """
 
 from __future__ import annotations
@@ -99,14 +106,20 @@ def load_examples(results_dir: Path, attack: str) -> tuple[dict[int, dict], dict
 
 
 def select_top_per_case(
-    readouts: dict[int, dict], by_pool: dict[int, list[dict]], per_case: int
+    readouts: dict[int, dict], by_pool: dict[int, list[dict]], per_case: int | None
 ) -> list[int]:
     """`per_case` prompt(s) per confusion-matrix case, ranked by the largest
     |nota| reached anywhere in that prompt's (seed-only) position span --
     the same criterion used to pick the worked examples first prototyped as
     a Claude Artifact for this pipeline. Cases are discovered from the data
     (not hardcoded to TP/FP/FN/TN), so an "unknown"-verdict prompt is still
-    selectable, not silently invisible."""
+    selectable, not silently invisible.
+
+    `per_case=None` (`--select all`) drops the cap and returns every prompt
+    that has at least one seed-span row, still grouped by case and ranked by
+    peak |nota| within each -- so a full-corpus dump still reads strongest
+    example first per case, not in raw pool_index order.
+    """
     by_case: dict[str, list[tuple[int, float]]] = {}
     for pool_index, rows in by_pool.items():
         if not rows:
@@ -119,7 +132,8 @@ def select_top_per_case(
     for case in cases:
         # tie-break by pool_index ascending, for determinism
         ranked = sorted(by_case.get(case, []), key=lambda x: (-x[1], x[0]))
-        selected.extend(pi for pi, _ in ranked[:per_case])
+        limit = len(ranked) if per_case is None else per_case
+        selected.extend(pi for pi, _ in ranked[:limit])
     return selected
 
 
@@ -172,10 +186,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--select",
-        choices=["top-per-case", "pool-index"],
+        choices=["top-per-case", "pool-index", "all"],
         default="top-per-case",
         help="'top-per-case': highest peak |nota| per TP/FP/FN/TN case present. "
-        "'pool-index': explicit --pool-index list.",
+        "'pool-index': explicit --pool-index list. "
+        "'all': every prompt in the results dir (one page, grouped by case, "
+        "ranked by peak |nota| within each case) -- opts into full-corpus size.",
     )
     parser.add_argument("--per-case", type=int, default=1)
     parser.add_argument("--pool-index", type=int, nargs="+", default=None)
@@ -193,6 +209,8 @@ def main() -> None:
         if not args.pool_index:
             raise ValueError("--select pool-index requires --pool-index <id> [<id> ...]")
         selected = args.pool_index
+    elif args.select == "all":
+        selected = select_top_per_case(readouts, by_pool, None)
     else:
         selected = select_top_per_case(readouts, by_pool, args.per_case)
 

@@ -1,0 +1,9 @@
+# piarena_eval/ shares guardrail_eval/.venv (no separate venv) -- these are
+# the extra packages beyond what guardrail_eval/requirements.txt already
+# installs (pandas, transformers, torch, ...).
+huggingface_hub
+pyarrow
+# Installed but NOT required: the `datasets` library. Its config
+# auto-detection doesn't apply here (sleeepeer/PIArena has no declared
+# builder configs -- prepare_piarena_data.py downloads each config's
+# parquet file directly via huggingface_hub.hf_hub_download + pd.read_parquet).

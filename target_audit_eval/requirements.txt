@@ -1,0 +1,18 @@
+# target_audit_eval/ shares guardrail_eval/.venv (no separate venv) -- these
+# are the extra packages beyond what guardrail_eval/requirements.txt already
+# lists. CONFIRMED (2026-08) not yet installed in guardrail_eval/.venv despite
+# being in that file's list -- guardrail_eval/audit_agent.py apparently never
+# ran locally before this. Install into the shared venv before running
+# run_smoke_test.py:
+#   guardrail_eval\.venv\Scripts\python.exe -m pip install openai groq python-dotenv pydantic
+#
+# openai        -- unused directly here, but a transitive expectation of
+#                  reusing guardrail_eval/audit_agent.py's helpers
+# groq          -- the judge client (openai/gpt-oss-20b is Groq-hosted, same
+#                  provider as audit_agent.py's existing openai/gpt-oss-120b
+#                  judge) -- runs entirely over the network, no local weights
+# python-dotenv -- reads the repo-root .env for GROQ_API_KEY/GPT_API_KEY
+# pydantic      -- response schema validation for the judge's JSON output
+#
+# torch/transformers/pandas (for the target model + PIArena CSVs) are already
+# in guardrail_eval/requirements.txt and confirmed installed.
