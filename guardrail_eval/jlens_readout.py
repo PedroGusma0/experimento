@@ -296,13 +296,27 @@ class GuardrailLens:
             **kwargs,
         )
 
-    def classify(self, prompt_str: str, *, max_new_tokens: int = 8) -> tuple[str, str]:
+    def classify(
+        self, prompt_str: str, *, max_new_tokens: int = 8, max_seq_len: int = 512
+    ) -> tuple[str, str]:
         """Greedy-generate the verdict. Returns (parsed_label, raw_text).
 
         Uses ``model.encode`` so the token sequence is identical to the one the
         lens reads in :meth:`readout` — the decision position lines up exactly.
+
+        Args:
+            max_seq_len: Truncate the prompt to this many tokens (passed to
+                ``model.encode``, mirroring ``JacobianLens.apply``'s own
+                ``max_seq_len``). Default 512 preserves every existing
+                pipeline's behavior unchanged (Phase 0-3's HarmBench-based
+                seeds are short enough this was never binding); PIArena's
+                longer QA/RAG contexts (v3) need this raised explicitly, or
+                the prompt is silently truncated — this can cut off the
+                trailing "Classification:" cue entirely, producing an
+                `"unknown"` verdict that has nothing to do with the model's
+                actual classification ability.
         """
-        input_ids = self.model.encode(prompt_str)
+        input_ids = self.model.encode(prompt_str, max_length=max_seq_len)
         attention_mask = torch.ones_like(input_ids)
         with torch.no_grad():
             output_ids = self.hf.generate(
@@ -329,6 +343,7 @@ class GuardrailLens:
         layers: list[int] | None,
         positions: list[int],
         top_k: int,
+        max_seq_len: int = 512,
     ) -> dict[int, dict[int, list[dict]]]:
         """Shared readout core: one ``lens.apply`` call, topk per (layer, position).
 
@@ -336,9 +351,14 @@ class GuardrailLens:
         negative indices, via advanced indexing) -- nothing in ``jlens/`` needs
         to change for multi-position reads. Returns
         ``{layer: {position: [{"tok": str, "score": float}, ...]}}``.
+
+        ``max_seq_len`` is passed straight through to ``lens.apply``'s own
+        parameter of the same name (default 512, same truncation caveat as
+        :meth:`classify`).
         """
         lens_logits, _, _ = self.lens.apply(
-            self.model, prompt_str, layers=layers, positions=positions
+            self.model, prompt_str, layers=layers, positions=positions,
+            max_seq_len=max_seq_len,
         )
         result: dict[int, dict[int, list[dict]]] = {}
         for layer, logits in lens_logits.items():  # logits: [n_positions, vocab]
@@ -358,6 +378,7 @@ class GuardrailLens:
         layers: list[int] | None = None,
         position: int = -1,
         top_k: int = 25,
+        max_seq_len: int = 512,
     ) -> dict[int, list[dict]]:
         """Top-K J-lens tokens per layer at a single decision position.
 
@@ -366,12 +387,15 @@ class GuardrailLens:
             position: Sequence position to read at (default ``-1``, the last
                 prompt token — where the guardrail is poised to emit its verdict).
             top_k: How many top tokens to keep per layer.
+            max_seq_len: Truncate the prompt to this many tokens (see
+                :meth:`classify`'s docstring for the truncation caveat).
 
         Returns:
             ``{layer: [{"tok": str, "score": float}, ...]}`` (J-lens only).
         """
         multi = self._topk_per_layer_position(
-            prompt_str, layers=layers, positions=[position], top_k=top_k
+            prompt_str, layers=layers, positions=[position], top_k=top_k,
+            max_seq_len=max_seq_len,
         )
         return {layer: per_position[position] for layer, per_position in multi.items()}
 
@@ -382,6 +406,7 @@ class GuardrailLens:
         layers: list[int] | None = None,
         positions: list[int] | None = None,
         top_k: int = 25,
+        max_seq_len: int = 512,
     ) -> dict[int, dict[int, list[dict]]]:
         """Top-K J-lens tokens per (layer, position), for an arbitrary set of
         positions -- the multi-position counterpart to :meth:`readout`, used by
@@ -393,6 +418,8 @@ class GuardrailLens:
             positions: Sequence positions to read at. ``None`` defaults to
                 ``[-1]`` (same default as :meth:`readout`).
             top_k: How many top tokens to keep per (layer, position).
+            max_seq_len: Truncate the prompt to this many tokens (see
+                :meth:`classify`'s docstring for the truncation caveat).
 
         Returns:
             ``{layer: {position: [{"tok": str, "score": float}, ...]}}``.
@@ -400,11 +427,12 @@ class GuardrailLens:
         if positions is None:
             positions = [-1]
         return self._topk_per_layer_position(
-            prompt_str, layers=layers, positions=positions, top_k=top_k
+            prompt_str, layers=layers, positions=positions, top_k=top_k,
+            max_seq_len=max_seq_len,
         )
 
     def token_span(
-        self, prompt_str: str, *, last_n: int | None = None
+        self, prompt_str: str, *, last_n: int | None = None, max_seq_len: int = 512
     ) -> list[dict]:
         """Decoded (position, token) pairs for ``prompt_str``.
 
@@ -413,12 +441,13 @@ class GuardrailLens:
         guessing blindly. ``last_n`` keeps only the last N positions (a window
         around ``INPUT: {seed}...Classification:``, so the boilerplate system
         prompt doesn't drown the actual input) -- ``None`` returns every
-        position.
+        position. ``max_seq_len`` truncates the prompt before tokenizing (see
+        :meth:`classify`'s docstring for the truncation caveat).
 
         Returns:
             ``[{"position": int, "token": str}, ...]``, positions ascending.
         """
-        input_ids = self.model.encode(prompt_str)[0]
+        input_ids = self.model.encode(prompt_str, max_length=max_seq_len)[0]
         n = int(input_ids.shape[0])
         start = 0 if last_n is None else max(0, n - last_n)
         return [

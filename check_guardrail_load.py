@@ -53,6 +53,16 @@ def main() -> int:
         default="Some test context here.",
         help="CONTEXT half of the test chat_prompt_v3 call.",
     )
+    parser.add_argument(
+        "--max-seq-len", type=int, default=2048,
+        help="Truncate the prompt to this many tokens before classifying. "
+        "jlens's own default (512, via GuardrailLens.classify) silently "
+        "truncates longer prompts -- this can cut off the trailing "
+        "'Classification:' cue entirely, producing a meaningless 'unknown' "
+        "verdict that has nothing to do with the model's real classification "
+        "ability (confirmed on a real PIArena prompt during the pod run, see "
+        "ARCHITECTURE.md's truncation-bug note).",
+    )
     args = parser.parse_args()
 
     import torch
@@ -81,7 +91,7 @@ def main() -> int:
         print("  fold-into-user confirmed: REQUEST/CONTEXT content present in the single user turn\n")
 
     print("=== item 3: classify() end-to-end ===")
-    verdict, raw = gl.classify(prompt)
+    verdict, raw = gl.classify(prompt, max_seq_len=args.max_seq_len)
     print(f"  verdict={verdict!r}  raw={raw!r}\n")
 
     print("ALL CHECKS PASSED -- proceed to step 2 (workspace-band discovery), "

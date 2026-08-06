@@ -1016,57 +1016,122 @@ apply), but is explicitly **paused** — see Decision 1c.
   is the closest existing precedent for cross-provider judging in this
   repo, but not a decided dependency for this new judge.
 
-**Pod smoke-test plan (the next concrete step — not yet run).** Everything
-implementable without GPU access to `gemma-3-4b-it` is done (Decisions 1-7
-above); what remains needs the real model. Four things this smoke test
-exists to confirm, all previously flagged as open/unverified:
+**Pod smoke-test plan — status: steps 1 and 2 run for real on the pod,
+findings below; step 3 blocked by a real bug, now fixed.** Four things this
+smoke test exists to confirm, all previously flagged as open/unverified:
 
 1. `AutoModelForImageTextToText.from_pretrained("google/gemma-3-4b-it")`
    loads, and `jlens.from_hf` finds the text decoder inside it (the
    `language_model` layout).
-2. The now-implemented system-role fold-into-user path (Decision 7)
-   produces a prompt the model can actually act on — mechanically correct
-   per local testing, but never run through a real forward pass on this
-   model.
+2. The system-role fold-into-user path (Decision 7) produces a prompt the
+   model can actually act on.
 3. The workspace band: L14-26 is Qwen3-1.7B-specific (27 fitted layers);
-   `gemma-3-4b-it`'s own band is unknown and can only be found by reading
-   a few known-content prompts across every fitted layer.
+   `gemma-3-4b-it`'s own band was unknown.
 4. That `gemma-3-4b-it` (~8GB bf16) plus the causal sweep's working memory
-   actually fits the pod's GPU without OOM.
+   fits the pod's GPU without OOM.
 
-Ordered steps:
+Two standalone scripts at the **repo root** (not `causal_eval/`/
+`piarena_eval/` — deliberately outside either, since they're one-off pod
+diagnostics, not part of the regular v3 pipeline) implement steps 1-2:
+`check_guardrail_load.py` (item 1+2) and `check_workspace_band.py` (item 3,
+manual band discovery via `GuardrailLens.readout(layers=None)` across every
+fitted layer on a couple of illustrative prompts — one built-in
+`access_denial`-flavored attacked example, one clean, no `piarena_eval/data/`
+dependency required). Both validated locally first against Qwen3-1.7B as a
+stand-in (confirms the *scripts'* logic before spending pod time), then run
+for real on the pod (48GB VRAM · 50GB RAM · 9 vCPU, CUDA 12.8).
+
+**Real pod results (`google/gemma-3-4b-it`), confirming items 1-3:**
+- Loads fine via `AutoModelForImageTextToText`; `jlens.from_hf` finds the
+  decoder. `source_layers`: 33 fitted (0-32) of 34 total layers, `d_model`
+  2560 (vs. Qwen3-1.7B's 27/28, `d_model` 2048).
+- `supports_system_role=False` confirmed working exactly as designed: the
+  rendered prompt starts `<bos><start_of_turn>user\n{SYSTEM_PROMPT_V3
+  content}...` — Gemma's own turn tokens, system content folded into the
+  single user turn, no system turn at all.
+- **Workspace-band discovery, on a real access_denial-flavored attacked
+  example vs. its clean counterpart**: L0-9 pure formatting noise (same in
+  both prompts); L10-13 generic negative-affect vocabulary (`wrongdoing`,
+  `hypocrisy`, `paranoia`) — legible but **not yet discriminative**, appears
+  identically in both the attacked and clean prompt; L14-16 first
+  safety-specific vocabulary (`toxicity` at L14, `Violation` at L15,
+  `malware`/`unethical`/`Cybersecurity` at L16) — still identical between
+  attacked/clean, a generic "is this worth scrutinizing" disposition, not
+  the verdict itself; **L23**: first literal appearance of `benign`/`malign`
+  in both prompts, still paired/undifferentiated; **L23-32: where the two
+  prompts actually diverge** — in the clean prompt `benign` dominates
+  throughout with only a weak, late `malign` blip; in the attacked prompt
+  `malign` climbs steadily and becomes the top-1 token by L30-31. Both test
+  prompts were also classified correctly (`attacked`→`malign`,
+  `clean`→`benign`). **Recommended band: `--layer-lo 14 --layer-hi 32`**
+  (mirrors how Qwen3-1.7B's L14-26 was chosen: from first legibility through
+  the final layer, not narrowed to only the most-discriminative range);
+  `--layer-lo 23 --layer-hi 32` is the tighter/cheaper alternative if only
+  the actually-discriminative range is wanted.
+
+**A real bug found and fixed before step 3 could run: prompts were being
+silently truncated at 512 tokens.** `jlens.hf.HFLensModel.encode` and
+`JacobianLens.apply` both default `max_seq_len=512` (sensible defaults for a
+library that doesn't know the caller's use case) — but `GuardrailLens`
+(`classify`/`readout`/`readout_multi`/`token_span`) never exposed or passed
+a larger value through, so every call was silently capped at 512 regardless
+of the actual prompt length. This was never triggered by Phase 0-3/causal
+v2 (HarmBench-based seeds are short enough to rarely approach 512) but
+`dolly_closed_qa`'s contexts average ~706-1062 tokens (Table 8) — most rows
+exceed it. **Confirmed directly** on the pod's first real
+`run_causal_pipeline_piarena.py` smoke: `sample_index=1` (both `clean` and
+`direct`) came back `seq_len=512` exactly and `verdict="unknown"` — not a
+coincidence. Reproduced and root-caused locally (Qwen3-1.7B, same
+`dolly_closed_qa` row): at `max_length=512` the prompt is truncated
+mid-sentence *inside the context*, never reaching the trailing
+`"Classification:"` cue at all, so the model just continues the cut-off
+sentence (`"...ization ability, which allows them to perform"`) instead of
+emitting a verdict; at `max_length=2048` (the full 2036-token prompt,
+untruncated) it correctly classifies `benign`.
+
+**Fix**: `GuardrailLens.classify`/`readout`/`readout_multi`/`token_span` all
+gained an explicit `max_seq_len: int = 512` parameter, threaded straight
+through to `model.encode`/`lens.apply`'s own parameter of the same name.
+Default kept at 512 — preserves Phase 0-3/causal v2 exactly as validated,
+nothing there needed a larger value and nothing there changes. v3's driver
+(`run_causal_pipeline_piarena.py`) and both pod-check scripts now expose
+`--max-seq-len` (default **2048** — comfortably covers `dolly_closed_qa`
+and the other short/RAG configs; **the `_long` configs need this raised
+further**, up to ~19k tokens of context per Table 8 — not yet a default
+anywhere, must be passed explicitly per-config) and pass it to every
+`model.encode`/`classify` call, including the two internal calls that
+compute `p_start`/`p_end` from prompt prefixes (same bound, since a prefix
+can never exceed the full prompt's token count). A `[warn]` prints if a
+row's `seq_len` hits the `--max-seq-len` ceiling exactly, flagging a likely
+truncation on sight instead of leaving it to be inferred from a suspiciously
+round `seq_len`. `make_slices_piarena.py` is not affected (never calls
+`classify`; `compute_slice`'s own `max_seq_len` is a separate, already-
+exposed parameter, currently defaulted to 768 there — same "_long configs
+need it raised" caveat applies if pointed at one).
+
+Ordered steps (updated):
 
 ```bash
 # 0. Setup (idempotent, already validated in Phase 3)
 bash guardrail_eval/setup_pod.sh
+guardrail_eval/.venv/bin/pip install -r piarena_eval/requirements.txt  # pyarrow -- setup_pod.sh doesn't install this yet, a real gap hit on the pod
 
-# 1. Load-only check (confirms items 1+2 above; no sweep, so the still-
-#    unknown workspace band can't cause a crash here). Also prints
-#    gl.lens.source_layers, needed for step 2.
-guardrail_eval/.venv/bin/python -c "
-import sys; sys.path.insert(0, 'guardrail_eval')
-from jlens_readout import GuardrailLens
-import torch
-gl = GuardrailLens('google/gemma-3-4b-it', dtype=torch.bfloat16, device='cuda')
-print('source_layers:', gl.lens.source_layers)
-print('n_layers:', gl.model.n_layers)
-print('supports_system_role:', gl._supports_system_role)
-p = gl.chat_prompt_v3('Summarize the following.', 'Some test context here.')
-print(p[:300])
-print(gl.classify(p))
-"
+# 1. Load-only check (confirms items 1+2) -- DONE, see findings above.
+guardrail_eval/.venv/bin/python check_guardrail_load.py \
+    --guardrail-model google/gemma-3-4b-it --device cuda --dtype bfloat16
 
-# 2. Workspace-band discovery (item 3): read a couple of PIArena rows
-#    across ALL fitted layers (layers=None) at the decision position, the
-#    same way Phase 1 originally found Qwen3-1.7B's L14-26 by inspection --
-#    look for where harm/injection-related tokens start appearing in the
-#    readout, then pick --layer-lo/--layer-hi for step 3 from that.
+# 2. Workspace-band discovery (item 3) -- DONE, see findings above.
+guardrail_eval/.venv/bin/python check_workspace_band.py \
+    --guardrail-model google/gemma-3-4b-it --device cuda --dtype bfloat16
 
-# 3. Small smoke of the real driver (confirms item 4, end-to-end):
+# (build the config's data first if not already on this pod)
+guardrail_eval/.venv/bin/python piarena_eval/prepare_piarena_data.py --config dolly_closed_qa
+
+# 3. Small smoke of the real driver (confirms item 4, end-to-end) -- next step:
 guardrail_eval/.venv/bin/python causal_eval/run_causal_pipeline_piarena.py \
     --guardrail-model google/gemma-3-4b-it --device cuda --dtype bfloat16 \
     --config dolly_closed_qa --variant both --n-samples 2 \
-    --layer-lo <from step 2> --layer-hi <from step 2> --verbose
+    --layer-lo 14 --layer-hi 32 --max-seq-len 2048 --verbose
 # watch `nvidia-smi` during this run, not just at load time.
 ```
 
@@ -1224,6 +1289,10 @@ for each attack in {baseline, baseline-wrapping}, for a smoke subset:
 ## File map
 
 ```
+(repo root)
+├── check_guardrail_load.py   # pod smoke-test step 1: load-only check for a new guardrail (layout, system-role fold-into-user, classify() end-to-end)
+├── check_workspace_band.py   # pod smoke-test step 2: manual workspace-band discovery (full-layer readout on an attacked + a clean example, built-in fallback or --prompts-from real PIArena rows)
+
 guardrail_eval/
 ├── requirements.txt          # torch, transformers, pandas, tqdm (+ jlens via pip install -e ..)
 ├── prepare_data.py           # Phase 0: harmbench.csv -> harmbench_labeled.csv

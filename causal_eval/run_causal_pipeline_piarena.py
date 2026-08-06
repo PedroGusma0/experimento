@@ -170,9 +170,13 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
 
             t0 = time.perf_counter()
             prompt = gl.chat_prompt_v3(row["target_inst"], row["context"])
-            input_ids = gl.model.encode(prompt)
+            input_ids = gl.model.encode(prompt, max_length=args.max_seq_len)
             seq_len = int(input_ids.shape[1])
-            verdict, _ = gl.classify(prompt)
+            if seq_len >= args.max_seq_len:
+                print(f"  [warn] sample_index={sample_index}: prompt truncated at "
+                      f"--max-seq-len={args.max_seq_len} (seq_len == max_seq_len) -- "
+                      f"the verdict below may be based on an incomplete prompt")
+            verdict, _ = gl.classify(prompt, max_seq_len=args.max_seq_len)
             case = _case(attacked, verdict)
             gated_to_sweep = verdict == "malign"
 
@@ -186,8 +190,12 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
                 try:
                     prefix_start = prompt.index(context_text)
                     prefix_end = prefix_start + len(context_text)
-                    p_start = int(gl.model.encode(prompt[:prefix_start]).shape[1])
-                    p_end = int(gl.model.encode(prompt[:prefix_end]).shape[1])
+                    p_start = int(gl.model.encode(
+                        prompt[:prefix_start], max_length=args.max_seq_len
+                    ).shape[1])
+                    p_end = int(gl.model.encode(
+                        prompt[:prefix_end], max_length=args.max_seq_len
+                    ).shape[1])
                 except ValueError:
                     p_start = 16
                     p_end = seq_len
@@ -272,6 +280,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--layer-hi", type=int, default=26)  # workspace band hi (Qwen3)
     p.add_argument("--last-n", type=int, default=None,
                    help="sweep only the last N context positions (keeps local runs feasible)")
+    p.add_argument("--max-seq-len", type=int, default=2048,
+                   help="Truncate the rendered prompt to this many tokens before "
+                   "encoding/classifying (passed to GuardrailLens.classify/model.encode; "
+                   "jlens' own default is 512, too short for most PIArena contexts -- "
+                   "see ARCHITECTURE.md's truncation-bug note). Raise further for the "
+                   "_long configs (up to ~19k tokens of context, Table 8).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--verbose", action="store_true")

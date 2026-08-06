@@ -110,6 +110,14 @@ def main() -> int:
         "Uses the first --n-examples rows.",
     )
     parser.add_argument("--n-examples", type=int, default=2)
+    parser.add_argument(
+        "--max-seq-len", type=int, default=2048,
+        help="Truncate prompts to this many tokens before classifying/reading "
+        "out (jlens's own default, 512, silently truncates most real PIArena "
+        "contexts -- confirmed on a real prompt during the pod run, see "
+        "ARCHITECTURE.md's truncation-bug note). Raise this if pointing "
+        "--prompts-from at a _long config.",
+    )
     args = parser.parse_args()
 
     import torch
@@ -133,9 +141,12 @@ def main() -> int:
 
     for ex in examples:
         prompt = gl.chat_prompt_v3(ex["target_inst"], ex["context"])
-        verdict, _ = gl.classify(prompt)
+        verdict, _ = gl.classify(prompt, max_seq_len=args.max_seq_len)
         print(f"=== {ex['label']} (verdict={verdict}) ===")
-        readout = gl.readout(prompt, layers=None, position=-1, top_k=args.top_k)
+        readout = gl.readout(
+            prompt, layers=None, position=-1, top_k=args.top_k,
+            max_seq_len=args.max_seq_len,
+        )
         for layer in layers:
             toks = ", ".join(f"{t['tok']!r}" for t in readout[layer])
             print(f"  L{layer:>2}: {toks}")
