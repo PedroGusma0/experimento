@@ -38,6 +38,27 @@ DATA = HERE / "data"
 REPO_ID = "sleeepeer/PIArena"
 DEFAULT_CONFIG = "dolly_closed_qa"
 
+#: The paper's 13 main-eval configs (Table 8, 1700 rows total) -- excludes
+#: the 3 `_knowledge_corruption` variants (nq/hotpotqa/msmarco_rag), which
+#: belong to the separate §5.4 task-alignment experiment, not this one (see
+#: ARCHITECTURE.md, Decision 2). Pass ``--config all-main`` to build all 13
+#: in one invocation instead of naming them one at a time.
+MAIN_CONFIGS: list[str] = [
+    "squad_v2",
+    "dolly_closed_qa",
+    "dolly_information_extraction",
+    "dolly_summarization",
+    "nq_rag",
+    "msmarco_rag",
+    "hotpotqa_rag",
+    "hotpotqa_long",
+    "qasper_long",
+    "gov_report_long",
+    "multi_news_long",
+    "passage_retrieval_en_long",
+    "lcc_long",
+]
+
 _EXPECTED_COLUMNS = {
     "target_inst",
     "context",
@@ -89,7 +110,7 @@ def download_config(config: str) -> pd.DataFrame:
     return df
 
 
-def build_clean(df: pd.DataFrame) -> pd.DataFrame:
+def build_clean(df: pd.DataFrame, *, config: str) -> pd.DataFrame:
     """PIArena's own "No Attack" condition: `context` used as-is, nothing
     inserted -- the `clean` half of the `attacked`/`clean` case scheme
     (ARCHITECTURE.md, Decision 4)."""
@@ -97,6 +118,7 @@ def build_clean(df: pd.DataFrame) -> pd.DataFrame:
         ["sample_index", "target_inst", "context", "target_task_answer", "category"]
     ].copy()
     clean["attacked"] = False
+    clean.insert(1, "config", config)
     return clean
 
 
@@ -120,13 +142,17 @@ def insert_injected_task(context: str, injected_task: str, position: str) -> str
     raise ValueError(f"unknown position {position!r}, expected start/middle/end")
 
 
-def build_direct(df: pd.DataFrame, *, position: str) -> pd.DataFrame:
+def build_direct(df: pd.DataFrame, *, config: str, position: str) -> pd.DataFrame:
     """PIArena's Direct attack: `injected_task` inserted verbatim into
     `context` at `position`. Also records the injected task's exact
     character span inside the contaminated context -- not yet consumed by
     the causal driver, but the ground-truth span attribution described in
     ARCHITECTURE.md's Decision 4 needs it, so it's captured here while the
-    clean/contaminated strings are already in hand."""
+    clean/contaminated strings are already in hand. Carries `config` (the
+    source dataset name) on every row -- once multiple configs' `direct`
+    rows are combined into one file (see `combine_direct`), `sample_index`
+    alone is no longer unique across the combined corpus, only
+    `(config, sample_index)` is."""
     rows = []
     for row in df.itertuples():
         contaminated = insert_injected_task(row.context, row.injected_task, position)
@@ -142,6 +168,7 @@ def build_direct(df: pd.DataFrame, *, position: str) -> pd.DataFrame:
         rows.append(
             {
                 "sample_index": row.sample_index,
+                "config": config,
                 "target_inst": row.target_inst,
                 "context": contaminated,
                 "injected_task": row.injected_task,
@@ -157,28 +184,77 @@ def build_direct(df: pd.DataFrame, *, position: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument(
-        "--position", default="end", choices=["start", "middle", "end"]
-    )
-    args = parser.parse_args()
+def combine_direct(direct_frames: list[pd.DataFrame], *, out_path: Path) -> pd.DataFrame:
+    """Merge every config's `direct` rows (already built, one DataFrame per
+    config) into a single JSON file -- together, these *are* PIArena's full
+    Direct-attack corpus (Table 8's 1700 rows once all 13 main configs are
+    built), just split across per-config CSVs until now."""
+    combined = pd.concat(direct_frames, ignore_index=True)
+    combined.to_json(out_path, orient="records", indent=2, force_ascii=False)
+    return combined
 
-    DATA.mkdir(exist_ok=True)
-    print(f"downloading {REPO_ID}/{args.config} ...")
-    df = download_config(args.config)
+
+def build_one(config: str, position: str) -> pd.DataFrame:
+    print(f"downloading {REPO_ID}/{config} ...")
+    df = download_config(config)
     print(f"  {len(df)} rows, categories: {dict(df['category'].value_counts())}")
 
-    clean = build_clean(df)
-    clean_path = DATA / f"{args.config}_clean.csv"
+    clean = build_clean(df, config=config)
+    clean_path = DATA / f"{config}_clean.csv"
     clean.to_csv(clean_path, index=False)
     print(f"wrote {len(clean)} rows to {clean_path}")
 
-    direct = build_direct(df, position=args.position)
-    direct_path = DATA / f"{args.config}_direct.csv"
+    direct = build_direct(df, config=config, position=position)
+    direct_path = DATA / f"{config}_direct.csv"
     direct.to_csv(direct_path, index=False)
-    print(f"wrote {len(direct)} rows to {direct_path} (position={args.position})")
+    print(f"wrote {len(direct)} rows to {direct_path} (position={position})")
+    return direct
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        nargs="+",
+        default=[DEFAULT_CONFIG],
+        help="One or more PIArena config names, or the special value "
+        "'all-main' to build all 13 main-eval configs (Table 8) in one run.",
+    )
+    parser.add_argument(
+        "--position", default="end", choices=["start", "middle", "end"]
+    )
+    parser.add_argument(
+        "--combined-out",
+        default="direct_combined.json",
+        help="Filename (under data/) for the merged Direct-attack JSON "
+        "across every config built this run. Pass '' to skip writing it.",
+    )
+    args = parser.parse_args()
+
+    configs = MAIN_CONFIGS if args.config == ["all-main"] else args.config
+
+    DATA.mkdir(exist_ok=True)
+    failures = []
+    direct_frames = []
+    for i, config in enumerate(configs, start=1):
+        print(f"\n[{i}/{len(configs)}] {config}")
+        try:
+            direct_frames.append(build_one(config, args.position))
+        except Exception as exc:  # noqa: BLE001 -- one bad config shouldn't sink the batch
+            print(f"  [error] {config}: {exc}")
+            failures.append(config)
+
+    if len(configs) > 1:
+        ok = len(configs) - len(failures)
+        print(f"\ndone: {ok}/{len(configs)} configs built"
+              + (f", failed: {failures}" if failures else ""))
+
+    if args.combined_out and direct_frames:
+        combined_path = DATA / args.combined_out
+        combined = combine_direct(direct_frames, out_path=combined_path)
+        built_configs = sorted(set(combined["config"]))
+        print(f"\nwrote combined Direct-attack corpus: {len(combined)} rows "
+              f"across {len(built_configs)} config(s) {built_configs} -> {combined_path}")
 
 
 if __name__ == "__main__":

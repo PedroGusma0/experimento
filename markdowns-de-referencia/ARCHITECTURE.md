@@ -708,26 +708,20 @@ deliberately used:
 Ataque (PIArena: target_inst + context + injected_task → contaminated C')
         │
         ▼
-Guardrail (Qwen3-1.7B) classifies (target_inst ⊕ C')
+Guardrail (Qwen3-1.7B locally validated; google/gemma-3-4b-it
+           intended for the pod — see Decision 1b) classifies (target_inst ⊕ C')
         │
-        ├── benign ──────────────────────────────────────────┐
-        │                                                     ▼
-        └── malign ──► causal J-lens sweep (v2 machinery,     │
-                        `sweep_positions` over target_inst⊕C') │
-                        (target call blocked; see open        │
-                        questions below for what is recorded  │
-                        on this branch instead)                │
-                                                                ▼
-                                                     Modelo alvo generates
-                                                     over (target_inst, C')
-                                                                │
-                                                                ▼
-                                                   LLM-judge (PIArena §4.4/
-                                                   Appendix E template):
-                                                   ASR (completed
-                                                   injected_task?) + Utility
-                                                   (completed target_inst?)
+        ├── benign/unknown ──► "would call target model" recorded,
+        │                       nothing else happens (target model +
+        │                       judge deliberately out of scope for now —
+        │                       see Decision 1c: guardrail-only run)
+        └── malign ──► causal J-lens sweep (v2 machinery,
+                        `sweep_positions` over the CONTEXT span)
 ```
+
+The fuller diagram this originally showed (target model + LLM-judge on the
+non-`malign` branch) is still the eventual design (Decisions 5 below still
+apply), but is explicitly **paused** — see Decision 1c.
 
 **Decisions locked in during design discussion:**
 
@@ -739,6 +733,40 @@ Guardrail (Qwen3-1.7B) classifies (target_inst ⊕ C')
    when the guardrail says `malign` — playing the role of the main
    project's `XAI (?)` conditional detour, not a parallel, always-on
    measurement like in v2's Run 2.
+1b. **Guardrail for the pod run: `google/gemma-3-4b-it`, not a new
+   `gemma-4-e4b` guardrail.** A `gemma-4-e4b` guardrail (new lens, new
+   model) was investigated and found **blocked**, not just unverified:
+   - The `neuronpedia/jacobian-lens` lens for `gemma-4-e4b` is fitted
+     against `google/gemma-4-E4B` specifically (confirmed via that lens's
+     own `config.yaml`: `hf_model_name: "google/gemma-4-E4B"`) — the **base**
+     model, not an instruction-tuned one. Checked directly: this base model
+     has **no `chat_template` at all** (`tokenizer_config.json` has no
+     `chat_template` key), so `apply_chat_template` — which
+     `chat_prompt_v3` depends on — would fail outright, not just perform
+     poorly.
+   - `google/gemma-4-e4b-it` (the instruction-tuned checkpoint that *would*
+     have a chat template) exists on the Hub, but **no lens has been fitted
+     for it** in the `neuronpedia/jacobian-lens` repo — only the base
+     model's lens exists for gemma-4. Using the base model's `J_l` against
+     the `-it` checkpoint's activations would be mathematically invalid
+     (the Jacobian is specific to the exact weights it was fit against).
+   - **Resolution: use `google/gemma-3-4b-it` instead** — its
+     `GuardrailPreset` already existed in `jlens_readout.py` (added before
+     this session, alongside Qwen3-1.7B) with a real fitted lens
+     (`gemma-3-4b-it/jlens/Salesforce-wikitext/gemma-3-4b-it_jacobian_lens.pt`,
+     confirmed present on the Hub) **and** a real instruction-tuned
+     checkpoint with its own chat template. No new preset needed, just
+     `--guardrail-model google/gemma-3-4b-it` at run time.
+1c. **Scope for the next pod run: guardrail-only.** The target model and
+   the ASR/Utility judge (Decision 5 below) are deliberately **not** part
+   of this run — paused, not abandoned. The non-`malign` branch simply
+   records `would_call_target_model: true, target_model_implemented:
+   false` and stops, exactly as it already does locally. This narrows the
+   pod's job to: does the guardrail (now `gemma-3-4b-it`) classify PIArena
+   samples sensibly, and does the causal sweep produce sane output on this
+   different model, across the **full PIArena main-eval corpus** (Decision
+   2's `all-main`, not just `dolly_closed_qa`) — not "does the whole v3
+   pipeline including target+judge work."
 2. **Adopt PIArena's dataset schema** (`target_inst`, `context`,
    `injected_task`, `target_task_answer`, `injected_task_answer`,
    `category` — Figure 3 of the paper), replacing the current
@@ -765,6 +793,19 @@ Guardrail (Qwen3-1.7B) classifies (target_inst ⊕ C')
    below) owns downloading/building this: `prepare_piarena_data.py` writes
    `piarena_eval/data/dolly_closed_qa_clean.csv` and
    `..._direct.csv`.
+   **Implemented since: multi-config scaling.** `--config` on both
+   `prepare_piarena_data.py` and `run_causal_pipeline_piarena.py` now
+   accepts one or more config names, or the literal value `all-main`
+   (expands to `MAIN_CONFIGS`, the 13 main-eval names from Table 8) — no
+   longer limited to building/running `dolly_closed_qa` alone. Also new:
+   `prepare_piarena_data.py` writes a merged `data/direct_combined.json`
+   (one JSON array, every config's `direct` rows concatenated, each row
+   tagged with its source `config` since `sample_index` alone is only
+   unique *within* a config) after building whichever configs were
+   requested — a single artifact for "the full PIArena Direct-attack
+   corpus," alongside the still-written per-config CSVs (which the drivers
+   still read from; the combined JSON is an extra convenience view, not a
+   replacement).
 3. **Attack mode: start with Direct only.** PIArena's simplest mode — the
    `injected_task` inserted verbatim into `context` at a chosen position
    (beginning/middle/end), no rewriting, no attacker LLM — chosen
@@ -902,11 +943,35 @@ Guardrail (Qwen3-1.7B) classifies (target_inst ⊕ C')
    noted above between abstraction and operationalizability for a 1.7B
    model), remains an empirical question for whenever this prompt is
    actually run, not something resolved by wording alone.
-   **Dependency, not yet resolved:** this prompt assumes the rendered user
-   turn separates `REQUEST`/`CONTEXT` labels (vs. today's single
-   `"INPUT: {seed}"` in `chat_prompt`) — `chat_prompt` (or a new sibling
-   method) needs a matching update once v3's input-building code exists;
-   tracked here, not implemented.
+   **Dependency, now resolved by implementation:** `chat_prompt_v3(target_inst,
+   context)` (a new sibling method, `guardrail_eval/jlens_readout.py`) renders
+   exactly the `REQUEST`/`CONTEXT` split this prompt assumes;
+   `chat_prompt`/`SYSTEM_PROMPT` (v1/v2) are untouched.
+7. **System-role handling: resolved, not just a guess to verify on the pod.**
+   `chat_prompt_v3` (like `chat_prompt`) builds a `{"role": "system", ...}`
+   message — fine for Qwen3, but Gemma's instruction-tuned models (any of
+   them, not model-specific) **do not support a system turn at all**, per
+   Google's own docs (https://ai.google.dev/gemma/docs/core/prompt-structure):
+   *"Gemma's instruction-tuned models are designed to work with only two
+   roles: user and model. Therefore, the system role or a system turn is not
+   supported... provide system-level instructions directly within the
+   initial user prompt."* This wasn't a per-checkpoint unknown to verify on
+   the pod (Gemma 2 already didn't accept it either) — it's a confirmed,
+   general fact about the model family. **Implemented**: `GuardrailPreset`
+   gained a `supports_system_role: bool = True` field (default preserves
+   every existing preset's behavior unchanged); `google/gemma-3-4b-it`'s
+   preset sets it `False`. A shared `GuardrailLens._build_messages(system,
+   user)` helper (used by both `chat_prompt` and `chat_prompt_v3`) returns
+   `[{"role": "system", ...}, {"role": "user", ...}]` when supported, or a
+   single `{"role": "user", "content": f"{system}\n\n{user}"}` message when
+   not. Verified locally: Qwen3-1.7B's rendered prompts are byte-identical
+   to before (still `<|im_start|>system`); simulating `supports_system_role
+   = False` on the same loaded model confirmed the fold-into-user path
+   produces a single well-formed user turn with the system content prepended
+   and no system role used. Not yet verified: that this is *sufficient* for
+   `gemma-3-4b-it` specifically to follow the classifier instructions
+   reliably when folded this way — only that the code path is mechanically
+   correct.
 
 **Open questions, resolved vs. still open (updated as of implementation):**
 
@@ -950,6 +1015,115 @@ Guardrail (Qwen3-1.7B) classifies (target_inst ⊕ C')
   driver) — none of this has been chosen yet; Phase 3's `audit_agent.py`
   is the closest existing precedent for cross-provider judging in this
   repo, but not a decided dependency for this new judge.
+
+**Pod smoke-test plan (the next concrete step — not yet run).** Everything
+implementable without GPU access to `gemma-3-4b-it` is done (Decisions 1-7
+above); what remains needs the real model. Four things this smoke test
+exists to confirm, all previously flagged as open/unverified:
+
+1. `AutoModelForImageTextToText.from_pretrained("google/gemma-3-4b-it")`
+   loads, and `jlens.from_hf` finds the text decoder inside it (the
+   `language_model` layout).
+2. The now-implemented system-role fold-into-user path (Decision 7)
+   produces a prompt the model can actually act on — mechanically correct
+   per local testing, but never run through a real forward pass on this
+   model.
+3. The workspace band: L14-26 is Qwen3-1.7B-specific (27 fitted layers);
+   `gemma-3-4b-it`'s own band is unknown and can only be found by reading
+   a few known-content prompts across every fitted layer.
+4. That `gemma-3-4b-it` (~8GB bf16) plus the causal sweep's working memory
+   actually fits the pod's GPU without OOM.
+
+Ordered steps:
+
+```bash
+# 0. Setup (idempotent, already validated in Phase 3)
+bash guardrail_eval/setup_pod.sh
+
+# 1. Load-only check (confirms items 1+2 above; no sweep, so the still-
+#    unknown workspace band can't cause a crash here). Also prints
+#    gl.lens.source_layers, needed for step 2.
+guardrail_eval/.venv/bin/python -c "
+import sys; sys.path.insert(0, 'guardrail_eval')
+from jlens_readout import GuardrailLens
+import torch
+gl = GuardrailLens('google/gemma-3-4b-it', dtype=torch.bfloat16, device='cuda')
+print('source_layers:', gl.lens.source_layers)
+print('n_layers:', gl.model.n_layers)
+print('supports_system_role:', gl._supports_system_role)
+p = gl.chat_prompt_v3('Summarize the following.', 'Some test context here.')
+print(p[:300])
+print(gl.classify(p))
+"
+
+# 2. Workspace-band discovery (item 3): read a couple of PIArena rows
+#    across ALL fitted layers (layers=None) at the decision position, the
+#    same way Phase 1 originally found Qwen3-1.7B's L14-26 by inspection --
+#    look for where harm/injection-related tokens start appearing in the
+#    readout, then pick --layer-lo/--layer-hi for step 3 from that.
+
+# 3. Small smoke of the real driver (confirms item 4, end-to-end):
+guardrail_eval/.venv/bin/python causal_eval/run_causal_pipeline_piarena.py \
+    --guardrail-model google/gemma-3-4b-it --device cuda --dtype bfloat16 \
+    --config dolly_closed_qa --variant both --n-samples 2 \
+    --layer-lo <from step 2> --layer-hi <from step 2> --verbose
+# watch `nvidia-smi` during this run, not just at load time.
+```
+
+Only after all four are confirmed does scaling to `--config all-main`
+(Decision 2) and a larger `--n-samples` become a matter of budget, not
+correctness.
+
+**The real pod run (after the smoke): full PIArena Direct baseline, no
+`--last-n` cap.** Scope, confirmed in discussion: `--config all-main
+--variant direct` (not `both` — `clean` isn't part of this run), every one
+of the 1700 rows classified, the causal sweep gated to `malign` only
+(unchanged — considered and explicitly rejected widening it to
+`malign`+`benign`, since the point is verifying the pipeline against a
+real, unmodified benchmark baseline, not maximizing sweep coverage).
+**Decision: no `--last-n` cap on `malign` rows — the sweep reads the whole
+`context`, uncapped, even on the `_long` configs.** Capping to a trailing
+window would systematically miss earlier positions (the whole point of a
+per-position causal sweep is to characterize *where* in the context the
+verdict comes from, including a start/middle-inserted `injected_task` in a
+future run) — accepted trade-off: a single `malign` hit inside a `_long`
+config (Qasper/GovReport/MultiNews/PassageRetrieval/LCC, 8-19k tokens of
+context) can cost far more than several short-context `malign` rows
+combined, since sweep cost scales directly with swept positions and those
+configs are swept in full.
+
+Cost formula, most terms still unknown until the smoke test produces real
+numbers on this guardrail:
+
+```
+tempo_total ≈ N_total × tempo_classify_medio
+            + Σ_malign_rows (n_context_positions_da_linha × tempo_por_posição)
+```
+
+| Term | Known now | Source |
+|---|---|---|
+| `N_total` | 1700 (13 configs, Table 8) | paper |
+| `tempo_classify_medio` | **Unknown** — CPU/Qwen smoke was 40-80s/row, but that's CPU; expect 1-2 orders of magnitude faster on this pod's GPU | pod smoke |
+| malign rate (drives how many terms are in the Σ) | **Unknown** — 1/12 (~8%) in the tiny CPU/Qwen smoke, but different model, different guardrail behavior expected | pod smoke |
+| `n_context_positions_da_linha` | Highly config-dependent: ~100-700 tokens (short QA/RAG configs) vs. 8,000-19,000 (the 5 `_long` configs) — no longer capped, so this is the row's actual context length | Table 8 avg lengths |
+| `tempo_por_posição` | Best real reference: v2's Run 2 (Qwen3-1.7B, RunPod CUDA/float32) measured ~0.2s/position. `gemma-3-4b-it` is ~2.3× the parameter count, so a rough scaled guess is ~0.4-0.6s/position — **to be replaced by the smoke test's actual measurement, not used as a real estimate** | Run 2 + guess |
+
+Practical consequence: before committing to `--config all-main` in one
+shot, measure `tempo_por_posição` on this guardrail via the smoke test
+(short-context config first, cheap to bound), then do a **separate**
+back-of-envelope pass specifically for the `_long` configs (their own
+average context length × measured `tempo_por_posição` × however many
+`malign` rows are expected there) before running them — a surprise there
+is the single biggest way this run's cost estimate could be wrong.
+
+**Pod spec for this run**: 48GB VRAM · 50GB RAM · 9 vCPU, CUDA 12.8/13.0
+available. VRAM/RAM are generously oversized for `gemma-3-4b-it` (~8GB
+bf16) — no OOM expected even accounting for the sweep's working memory.
+Prefer CUDA 12.8 over 13.0 if the pod template allows choosing — 13.0 is
+new enough that PyTorch wheel support may still be immature;
+`setup_pod.sh` derives the torch index from `torch.version.cuda`
+dynamically (not a hardcoded version) so it should adapt either way, but
+12.8 is the safer-tested path.
 
 **Candidate evaluation metrics for the target model (reference, not yet
 implemented).** `relatorio_experimento2.tex` (§"Métricas de Segurança e
@@ -1054,7 +1228,7 @@ guardrail_eval/
 ├── requirements.txt          # torch, transformers, pandas, tqdm (+ jlens via pip install -e ..)
 ├── prepare_data.py           # Phase 0: harmbench.csv -> harmbench_labeled.csv
 ├── run_baseline.py           # Phase 0: gemma-3-1b-it as classifier (SYSTEM_PROMPT, parse_label)
-├── jlens_readout.py          # Phase 1: GuardrailLens (Qwen3-1.7B + J-lens; chat_prompt/classify/readout)
+├── jlens_readout.py          # Phase 1: GuardrailLens (Qwen3-1.7B + J-lens; chat_prompt/classify/readout); also v3's SYSTEM_PROMPT_V3/chat_prompt_v3 + GuardrailPreset.supports_system_role/_build_messages (Gemma has no system role -- see v3 Decision 7)
 ├── run_guardrail_jlens.py    # Phase 1: driver over harmbench_labeled.csv
 ├── prepare_attack_data.py    # Phase 2: seed_pool.csv + attack_baseline*.csv builders
 ├── target_model.py           # Phase 2: TargetModel (gemma-3-1b-it, open-ended, no lens, no system prompt)
@@ -1086,20 +1260,22 @@ causal_eval/                     # root-level sibling of guardrail_eval/ (causal
 ├── interventions.py             # Causal primitives: lens_vectors/steer/ablate/ablate_span/swap/matched_norm_control + InterventionHook (write-capable) — moved here from guardrail_eval/
 ├── causal_sweep.py              # v2 orchestration: position_candidates (Fase 0) + sweep_positions (Fase 1+2, signed score) — reused unchanged by v3
 ├── run_causal_pipeline.py       # v2 driver: GuardrailLens -> sweep_positions -> results_causal/, --resume, --last-n, per-prompt timing
-├── run_causal_pipeline_piarena.py  # v3 driver: GuardrailLens.chat_prompt_v3 -> gated sweep (malign-only) -> results_causal_piarena/
+├── run_causal_pipeline_piarena.py  # v3 driver: GuardrailLens.chat_prompt_v3 -> gated sweep (malign-only) -> results_causal_piarena/; --config accepts several names or 'all-main'
+├── make_slices_piarena.py       # v3's jlens.vis.compute_slice pages for selected rows (join causal_readouts_* + piarena_eval CSV -> chat_prompt_v3 -> per-row index.html + a landing page listing all rendered rows)
 ├── run_plumbing_check.py        # manual smoke: position_candidates + ablate_span against the real guardrail (--device/--dtype)
 ├── results_causal/              # v2 driver output (gitignored — not committed); causal_readouts_<attack>.jsonl, causal_position_scores_<attack>.jsonl, causal_run_meta.json
-├── results_causal_piarena/      # v3 driver output (gitignored — not committed); causal_readouts_<config>_<variant>.jsonl, causal_position_scores_<config>_<variant>.jsonl, causal_run_meta_piarena.json
+├── results_causal_piarena/      # v3 driver output (gitignored — not committed); causal_readouts_<config>_<variant>.jsonl, causal_position_scores_<config>_<variant>.jsonl, causal_run_meta_piarena.json, slices/<config>_<variant>/{index.html, <sample_index>/index.html+meta.json+slice.bin+ranks/}
 └── tests/
     ├── test_interventions.py    # 13 invariant tests vs TinyDecoder (moved here; standalone script, reuses guardrail_eval/.venv)
     └── test_causal_sweep.py     # 8 tests: candidate selection + anti-confound guard + V_by_layer reuse + sweep_positions + KL helper
 
 piarena_eval/                    # root-level sibling of guardrail_eval/ and causal_eval/ (v3's dataset half)
 ├── requirements.txt             # extra deps beyond guardrail_eval/requirements.txt: huggingface_hub, pyarrow
-├── prepare_piarena_data.py      # downloads one sleeepeer/PIArena config's parquet (direct HF Hub file, no `datasets` lib config needed) -> {config}_clean.csv + {config}_direct.csv
+├── prepare_piarena_data.py      # downloads sleeepeer/PIArena configs' parquets (direct HF Hub file, no `datasets` lib config needed) -> {config}_clean.csv + {config}_direct.csv per config; --config accepts several names or 'all-main' (MAIN_CONFIGS, the 13 Table-8 configs); also writes data/direct_combined.json (all built configs' `direct` rows merged, tagged by `config`)
 └── data/
-    ├── dolly_closed_qa_clean.csv   # 200 rows: target_inst, context (as-is/"No Attack"), target_task_answer, category
-    └── dolly_closed_qa_direct.csv  # 200 rows: + injected_task, injected_task_answer, insert_position, injected_task_char_start/end (Direct attack, end-of-context by default)
+    ├── {config}_clean.csv          # per config: target_inst, context (as-is/"No Attack"), target_task_answer, category
+    ├── {config}_direct.csv         # per config: + config, injected_task, injected_task_answer, insert_position, injected_task_char_start/end (Direct attack, end-of-context by default)
+    └── direct_combined.json        # merged `direct` rows across every config built in one invocation
 ```
 
 ## What's validated so far
@@ -1176,9 +1352,64 @@ piarena_eval/                    # root-level sibling of guardrail_eval/ and cau
   - **Cost note for future runs**: that one `malign` row's 10-position
     sweep took ~1038s (~17.3 min) on CPU/bf16 — roughly 500× slower per
     position than v2's Run 2 on RunPod CUDA/float32 (~0.2s/position).
-    Confirms this pipeline needs the same CPU-for-smoke / GPU-for-scale
+    Confirms this pipeline needs the same CPU-for-scale / GPU-for-scale
     split as v2 (see `run_causal_pipeline.py`'s own docstring) — a CPU dry
     run only makes sense at 1-2 `malign` rows, not a real sample size.
+- **Multi-config scaling and the system-role fix, both implemented and
+  smoke-tested locally (Qwen3-1.7B only — neither has run against
+  `gemma-3-4b-it` yet, see the pod smoke-test plan above)**:
+  - `prepare_piarena_data.py --config squad_v2 dolly_summarization` and
+    `run_causal_pipeline_piarena.py --config squad_v2 dolly_summarization`
+    both confirmed working end-to-end (separate output files per config,
+    no cross-contamination); `direct_combined.json` confirmed valid (400
+    rows across the 2 test configs, `config` field present and correct on
+    every row, JSON parses and round-trips cleanly).
+  - The `supports_system_role`/`_build_messages` fold-into-user path
+    (Decision 7) confirmed two ways on the loaded Qwen3-1.7B model: (a)
+    unchanged behavior with the real preset (`supports_system_role=True`
+    default) — `chat_prompt`/`chat_prompt_v3` output byte-identical
+    `<|im_start|>system` framing to before the refactor; (b) simulating
+    `supports_system_role=False` on the same instance produces a single
+    well-formed `user` turn with `SYSTEM_PROMPT_V3` prepended, no system
+    role emitted. Only the code path is verified — whether folding actually
+    works well enough for `gemma-3-4b-it` to follow the classifier
+    instructions is still an open, real-model question (see the pod
+    smoke-test plan).
+- **`causal_eval/make_slices_piarena.py` implemented and smoke-tested
+  against the real Qwen3-1.7B guardrail** — fills the gap the gating leaves
+  open: the causal sweep only ever touches `malign` rows, so the 4
+  `unknown`-verdict rows from the smoke run above had zero J-lens data of
+  their own until this script. Joins `causal_readouts_<config>_<variant>.jsonl`
+  back to `piarena_eval/data/<config>_<variant>.csv` by `sample_index` to
+  recover `target_inst`/`context` (the readouts file itself doesn't store
+  prompt text), re-renders via `chat_prompt_v3`, and calls
+  `jlens.vis.compute_slice`/`build_page` completely unmodified — the dense
+  position × layer view (same page `walkthrough.ipynb` demonstrates) works
+  for any verdict, not just `malign`. Confirmed working end-to-end on the 4
+  real `unknown` rows (`sample_index` 1, 7, 9, 11): each gets its own
+  `mode="fetch"` page, plus a small hand-written landing page
+  (`slices/<config>_<variant>/index.html`, **not** part of `jlens` — checked
+  the package for an existing gallery/index mechanism and there is none)
+  listing every rendered row (verdict/case/category/`target_inst`) linking
+  to its own slice page, so a served directory can be browsed by clicking a
+  `sample_index` instead of tracking folder names by hand.
+  - **Bug found and fixed, present in `guardrail_eval/make_slices.py` too**:
+    `vis.build_page(mode="fetch")` only writes the sidecar data files
+    (`meta.json`/`slice.bin`/`ranks/*.bin`) — the HTML page itself is the
+    *returned* string, which the caller must write to `index.html` itself
+    (`walkthrough.ipynb`'s cell 5 does this correctly). Both the original
+    `make_slices.py` and this script's first draft discarded that return
+    value, so neither ever produced an openable page, only the data
+    sidecars. Fixed here; **`guardrail_eval/make_slices.py` still has the
+    same bug, not yet fixed** (out of this session's scope — flagged as a
+    known issue for whoever next touches that file).
+  - **Local RAM note**: this script's first draft copied
+    `make_slices.py`'s own `--dtype float32` default, which segfaulted
+    (exit 139, no Python traceback) on this ~7.7GB-RAM machine when free
+    RAM was down to ~830MB (other running applications, not this repo, ate
+    the rest). Defaulted to `bfloat16` instead, matching
+    `run_causal_pipeline*.py`'s existing reasoning for the same machine
+    constraint; not yet an issue on a RunPod GPU with proper headroom.
 
 ## Not yet built (explicitly out of scope so far)
 
@@ -1195,9 +1426,15 @@ piarena_eval/                    # root-level sibling of guardrail_eval/ and cau
   `run_causal_pipeline_piarena.py` doesn't yet cross-reference a swept
   position's token offset against that span; deferred, needs a token↔char
   offset mapping not yet wired in.
-- Only `dolly_closed_qa` has been downloaded/tested; the other 12 main-eval
-  PIArena configs (Table 8) and the `middle`/`start` insertion positions are
-  unexercised.
+- **Nothing in v3 has ever run against `gemma-3-4b-it`** — every result to
+  date (data prep, classify/gate/sweep, `make_slices_piarena.py`, the
+  system-role fix) is validated against Qwen3-1.7B only. See "Pod
+  smoke-test plan" above for the ordered steps to close this.
+- Multi-config *support* is implemented (`--config` accepts several names
+  or `all-main`), but only `dolly_closed_qa`, `squad_v2`, and
+  `dolly_summarization` have actually been downloaded/run — the other 10
+  main-eval PIArena configs (Table 8) are unexercised, and the `middle`/
+  `start` insertion positions remain untested (only `end` has been used).
 - Combined and Strategy attack modes (PIArena) — deferred past Direct, no
   code.
 - No blocking/gating logic **in the pre-v3 pipelines** — Phase 2, Phase 3,

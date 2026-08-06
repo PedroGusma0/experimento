@@ -52,12 +52,25 @@ class GuardrailPreset:
             ``*ForConditionalGeneration`` and are NOT in the CausalLM auto-map;
             jlens then locates the text decoder via its ``language_model``
             layout.
+        supports_system_role: Whether the chat template accepts a
+            ``{"role": "system", ...}`` message. Qwen3 does (``True``).
+            Gemma's instruction-tuned models do not: per Google's own docs
+            (https://ai.google.dev/gemma/docs/core/prompt-structure,
+            confirmed for the Gemma family generally, not model-specific)
+            "Gemma's instruction-tuned models are designed to work with only
+            two roles: user and model. Therefore, the system role or a
+            system turn is not supported" -- instructions must be folded
+            into the initial user turn instead. ``False`` makes
+            :meth:`GuardrailLens.chat_prompt`/``chat_prompt_v3`` do exactly
+            that, rather than passing a system message the template was
+            never trained to expect.
     """
 
     lens_file: str
     force_bos: bool
     disable_thinking: bool
     loader: str  # "causal_lm" | "image_text_to_text"
+    supports_system_role: bool = True
 
 
 #: Guardrail presets keyed by HF model id. Add an entry (with the matching lens
@@ -72,15 +85,17 @@ PRESETS: dict[str, GuardrailPreset] = {
     ),
     # gemma-3-4b-it: the intended RunPod guardrail. Multimodal checkpoint, so it
     # loads via AutoModelForImageTextToText (~8GB in bf16 -> GPU only, will not
-    # fit this CPU machine's ~7.7GB RAM). NOTE: unverified end-to-end here (can't
-    # run it locally) -- confirm on the first pod run that (a) it loads and
-    # jlens finds the text decoder, and (b) the gemma-3 chat template accepts a
-    # 'system' role; if not, fold SYSTEM_PROMPT into the user turn.
+    # fit this CPU machine's ~7.7GB RAM). NOTE: (a) loading + jlens finding the
+    # text decoder is still unverified end-to-end (can't run it locally) --
+    # confirm on the first pod run; (b) system-role support is NOT unverified
+    # anymore -- Google's docs confirm Gemma's instruct models don't support a
+    # system turn at all (see supports_system_role's docstring), hence False.
     "google/gemma-3-4b-it": GuardrailPreset(
         lens_file="gemma-3-4b-it/jlens/Salesforce-wikitext/gemma-3-4b-it_jacobian_lens.pt",
         force_bos=True,
         disable_thinking=False,
         loader="image_text_to_text",
+        supports_system_role=False,
     ),
 }
 
@@ -195,6 +210,7 @@ class GuardrailLens:
             lens_file = preset.lens_file
         force_bos = preset.force_bos if preset else True
         self._disable_thinking = preset.disable_thinking if preset else False
+        self._supports_system_role = preset.supports_system_role if preset else True
         loader = preset.loader if preset else "causal_lm"
 
         if loader == "image_text_to_text":
@@ -222,16 +238,33 @@ class GuardrailLens:
             lens_repo, filename=lens_file, revision=lens_revision
         )
 
+    def _build_messages(self, system_content: str, user_content: str) -> list[dict]:
+        """``[system, user]`` if the model's chat template supports a system
+        role (``supports_system_role=True``, e.g. Qwen3); otherwise the
+        system content is folded into the single user turn instead, per
+        Google's own guidance for Gemma's instruct models -- "the system
+        role or a system turn is not supported... provide system-level
+        instructions directly within the initial user prompt"
+        (https://ai.google.dev/gemma/docs/core/prompt-structure). Confirmed
+        for the Gemma family generally (Gemma 2 already didn't accept a
+        system role either), not a per-checkpoint guess.
+        """
+        if self._supports_system_role:
+            return [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ]
+        return [{"role": "user", "content": f"{system_content}\n\n{user_content}"}]
+
     def chat_prompt(self, seed: str) -> str:
         """Render the classifier chat prompt as a string.
 
         For Qwen3, ``enable_thinking=False`` is passed (otherwise it emits a
         ``<think>`` block that eats the token budget); Gemma has no such toggle.
         """
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"INPUT: {seed}\n\nClassification:"},
-        ]
+        messages = self._build_messages(
+            SYSTEM_PROMPT, f"INPUT: {seed}\n\nClassification:"
+        )
         kwargs = {}
         if self._disable_thinking:
             kwargs["enable_thinking"] = False
@@ -249,16 +282,10 @@ class GuardrailLens:
         :data:`SYSTEM_PROMPT` -- see that constant's docstring for why they
         are kept separate.
         """
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_V3},
-            {
-                "role": "user",
-                "content": (
-                    f"REQUEST: {target_inst}\n\nCONTEXT: {context}\n\n"
-                    "Classification:"
-                ),
-            },
-        ]
+        messages = self._build_messages(
+            SYSTEM_PROMPT_V3,
+            f"REQUEST: {target_inst}\n\nCONTEXT: {context}\n\nClassification:",
+        )
         kwargs = {}
         if self._disable_thinking:
             kwargs["enable_thinking"] = False

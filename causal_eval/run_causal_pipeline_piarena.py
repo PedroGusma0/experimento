@@ -22,20 +22,27 @@ Two things make this different from `run_causal_pipeline.py` (v2):
    `attacked+malign` and `clean+malign` ever reach the sweep, by
    construction of the gating above.
 
+`--config` accepts one or more PIArena config names (each must already be
+built by `prepare_piarena_data.py`), or the special value `all-main` for all
+13 main-eval configs (Table 8) in one run -- one pair of output files per
+(config, variant).
+
 Local smoke (cpu, bf16):
 
     guardrail_eval/.venv/Scripts/python.exe causal_eval/run_causal_pipeline_piarena.py \
-        --variant both --n-samples 2 --last-n 20
+        --config dolly_closed_qa --variant both --n-samples 2 --last-n 20
 
-Pod run (cuda, float32):
+Pod run (cuda, float32), full main-eval corpus:
 
     python causal_eval/run_causal_pipeline_piarena.py --device cuda --dtype float32 \
+        --guardrail-model google/gemma-3-4b-it --config all-main \
         --variant both --n-samples 15 --resume
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -45,16 +52,49 @@ import pandas as pd
 import torch
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "guardrail_eval"), os.path.dirname(__file__)):
+for _p in (
+    _REPO_ROOT,
+    os.path.join(_REPO_ROOT, "guardrail_eval"),
+    os.path.join(_REPO_ROOT, "piarena_eval"),
+    os.path.dirname(__file__),
+):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 from jlens_readout import GuardrailLens  # noqa: E402
 
 from causal_sweep import sweep_positions  # noqa: E402
+from prepare_piarena_data import MAIN_CONFIGS  # noqa: E402
 
 _DATA_DIR = os.path.join(_REPO_ROOT, "piarena_eval", "data")
 _OUT_DIR = os.path.join(os.path.dirname(__file__), "results_causal_piarena")
+
+#: One combined spreadsheet for the guardrail's output (verdict/case, not the
+#: position-level sweep detail, which stays in causal_position_scores_*.jsonl)
+#: across every (config, variant) processed in a single run -- open this one
+#: file in Excel/Sheets to eyeball verdict distribution, malign rate, etc.
+#: across the whole PIArena main-eval corpus instead of grepping 26 JSONLs.
+_SUMMARY_CSV_FIELDS = [
+    "sample_index", "config", "variant", "attacked", "verdict", "case",
+    "gated_to_causal_sweep", "would_call_target_model",
+    "target_model_implemented", "seq_len", "n_positions",
+    "elapsed_seconds", "guardrail_model",
+]
+
+
+def _summary_csv_path() -> str:
+    return os.path.join(_OUT_DIR, "guardrail_output.csv")
+
+
+def _append_summary_row(path: str, row: dict) -> None:
+    """Append one guardrail-output row to the combined CSV, writing the
+    header only the first time the file is created (or is empty)."""
+    write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_SUMMARY_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _case(attacked: bool, verdict: str) -> str:
@@ -185,7 +225,7 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
             # model and the ASR/Utility judge aren't implemented yet, so no
             # response is fabricated on either branch (see ARCHITECTURE.md's
             # resolved open question on the blocked branch).
-            fr.write(json.dumps({
+            readout_row = {
                 "sample_index": sample_index, "config": config, "variant": variant,
                 "attacked": attacked, "verdict": verdict, "case": case,
                 "gated_to_causal_sweep": gated_to_sweep,
@@ -194,8 +234,10 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
                 "seq_len": seq_len, "n_positions": n_positions,
                 "elapsed_seconds": round(elapsed, 3),
                 "guardrail_model": args.guardrail_model,
-            }) + "\n")
+            }
+            fr.write(json.dumps(readout_row) + "\n")
             fr.flush()
+            _append_summary_row(_summary_csv_path(), readout_row)
 
             avg = elapsed_total / n_timed
             remaining = n_todo - i
@@ -219,8 +261,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--guardrail-model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
-    p.add_argument("--config", default="dolly_closed_qa",
-                   help="PIArena config name (matches piarena_eval/data/{config}_*.csv)")
+    p.add_argument("--config", nargs="+", default=["dolly_closed_qa"],
+                   help="One or more PIArena config names (matches "
+                   "piarena_eval/data/{config}_*.csv), or 'all-main' for all "
+                   "13 main-eval configs (Table 8).")
     p.add_argument("--variant", default="both", choices=["clean", "direct", "both"])
     p.add_argument("--n-samples", type=int, default=5)
     p.add_argument("--k", type=int, default=10)
@@ -242,12 +286,25 @@ def main() -> int:
     gl = GuardrailLens(args.guardrail_model, dtype=dtype, device=args.device)
 
     os.makedirs(_OUT_DIR, exist_ok=True)
+
+    # The combined summary CSV spans every (config, variant) processed in
+    # this invocation (unlike the per-config JSONLs, which reset with -w
+    # unless --resume). Without --resume, start it fresh once here so a new
+    # run doesn't append onto a stale spreadsheet from a previous session;
+    # each row appended inside run_variant() from here on (see
+    # _append_summary_row) is additive and --resume-safe (a resumed row is
+    # simply never reprocessed, so it's never re-appended either).
+    if not args.resume and os.path.isfile(_summary_csv_path()):
+        os.remove(_summary_csv_path())
+
     with open(os.path.join(_OUT_DIR, "causal_run_meta_piarena.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
 
+    configs = MAIN_CONFIGS if args.config == ["all-main"] else args.config
     variants = ["clean", "direct"] if args.variant == "both" else [args.variant]
-    for variant in variants:
-        run_variant(gl, args.config, variant, args)
+    for config in configs:
+        for variant in variants:
+            run_variant(gl, config, variant, args)
     return 0
 
 
