@@ -198,31 +198,74 @@ def generate_with_context_ablation(
 
     with torch.no_grad():
         if positions:
+            # Only request logits from ctx_start onward (the context span
+            # plus whatever small suffix follows it, e.g. chat-template
+            # generation-prompt tokens) via `logits_to_keep` -- not the
+            # fixed prefix before it, and not a second full-vocab tensor
+            # later where only the last position is actually needed (see
+            # below). For a _long config (real context ~19k tokens) the
+            # full-sequence logits tensor alone is ~10.5GB (vocab ~262k x
+            # bf16); doing this twice (once here, once in the hooked pass)
+            # while also holding V_all + both models is what OOM'd a real
+            # pod run (`torch.OutOfMemoryError`, this session).
+            keep_from = seq_len - ctx_start
             with ActivationRecorder(tl.model.layers, at=layers) as rec:
                 clean_logits = tl.hf(
-                    input_ids=input_ids, attention_mask=attention_mask
-                ).logits[0]  # [seq_len, vocab]
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    logits_to_keep=keep_from,
+                ).logits[0]  # [seq_len - ctx_start, vocab]
                 residuals = {l: rec.activations[l][0].detach() for l in layers}
 
+            # This loop was completely silent before -- fine for short
+            # contexts (a few hundred positions, seconds total) but on a
+            # _long config's real (untruncated) context it can be
+            # thousands of positions and tens of minutes, indistinguishable
+            # from a hang without some periodic sign of life. Print at most
+            # ~20 times regardless of scale (every position for a short
+            # context, every ~500th for a long one) plus a running ETA.
+            n_positions = len(positions)
+            progress_every = max(1, n_positions // 20)
+            loop_t0 = time.perf_counter()
             per_position_V: dict[int, list[torch.Tensor]] = {l: [] for l in layers}
-            for p in positions:
+            for i, p in enumerate(positions, start=1):
                 residual_by_layer = {l: residuals[l][p] for l in layers}
-                guard = clean_logits[p].topk(guard_top_n).indices.tolist()
+                guard = clean_logits[p - ctx_start].topk(guard_top_n).indices.tolist()
                 cands = position_candidates(
                     tl.lens, unembed_weight, residual_by_layer,
                     k=k, exclude=guard, aggregate="max", V_by_layer=V_all,
                 )
                 for l in layers:
                     per_position_V[l].append(V_all[l][cands].T)  # [d_model, k]
+                if i % progress_every == 0 or i == n_positions:
+                    elapsed = time.perf_counter() - loop_t0
+                    eta = elapsed / i * (n_positions - i)
+                    print(f"    candidates {i}/{n_positions} context positions "
+                          f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)", flush=True)
+
+            # Free the clean pass's tensors before the hooked pass allocates
+            # its own -- both are large for a _long config and neither is
+            # needed anymore once per_position_V is built.
+            del clean_logits, residuals
+            torch.cuda.empty_cache()
 
             edits = {
                 l: (lambda h, Vs=per_position_V[l]: ablate_span_per_position(h, Vs))
                 for l in layers
             }
+            # logits_to_keep=1: only the LAST position's logits are actually
+            # used below (out.logits[0, -1, :], to pick the first generated
+            # token) -- computing the full [seq_len, vocab] tensor here was
+            # the other ~10.5GB half of the same OOM.
             with InterventionHook(tl.model.layers, edits, positions=positions):
-                out = tl.hf(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+                out = tl.hf(
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    use_cache=True, logits_to_keep=1,
+                )
         else:
-            out = tl.hf(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+            out = tl.hf(
+                input_ids=input_ids, attention_mask=attention_mask,
+                use_cache=True, logits_to_keep=1,
+            )
 
         eos_ids = _eos_id_set(tl)
         next_id = out.logits[0, -1, :].argmax().view(1, 1)
