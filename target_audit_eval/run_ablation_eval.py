@@ -561,35 +561,25 @@ def main() -> int:
         print(f"loading judge {args.judge_model} ({args.dtype}, {args.device}) ...")
         judge = JudgeLocal(args.judge_model, dtype=dtype, device=args.device)
 
-    # V_all is kept on CPU, deliberately -- NOT on the model's own device.
-    # gemma-3-4b-it's vocab (~262k) x d_model (2560) x the established
-    # workspace band (L14-32, 19 layers) is ~23.8GB in bf16 (~47.5GB in
-    # float32) -- on top of the target model (~8GB) and judge (~8GB) both
-    # already resident in VRAM, that does not fit the pod's ~44GB GPU
-    # (confirmed hardware from the v5 run, see ARCHITECTURE.md). Keeping
-    # V_all on CPU costs nothing extra in code: interventions.ablate_span
-    # already moves only the small per-position candidate slice ([d_model,
-    # k], not the full [vocab, d_model] table) to h's device on demand, and
-    # causal_sweep.position_candidates already moves the (tiny, [d_model])
-    # residual to V's device rather than the other way around.
-    #
-    # ALWAYS float32 for this, regardless of --dtype: CPU matmul has no
-    # reliably fast bf16 kernel on every CPU architecture (same class of gap
-    # already hit once in this repo -- torch.linalg.pinv has no bf16 CPU
-    # kernel at all, see interventions.ablate_span's own upcast). A stuck
-    # 5+ minute hang on this exact line, on a real pod run, is what
-    # surfaced this: the bf16 CPU matmul fell onto a slow path. float32
-    # doubles the RAM cost (~47.5GB for the full L14-32 band) but pod RAM is
-    # generously oversized for this (503GB, confirmed in results/
-    # run_metadata.json) -- CPU compute speed, not RAM, was the real
-    # constraint here.
-    print(f"precomputing W_U . J_l for layers {layers} (once, reused across all "
-          f"rows; kept on CPU in float32, not GPU/bf16 -- see comment above) ...")
-    unembed_weight_cpu = tl.hf.get_output_embeddings().weight.detach().to("cpu").float()
+    # V_all lives on the model's own device (GPU), same as the already-
+    # validated causal_eval/causal_sweep.py pattern (run_causal_pipeline.py /
+    # run_causal_pipeline_piarena.py never move it to CPU either) -- an
+    # earlier version of this script preemptively moved it to CPU on an
+    # untested guess that it wouldn't fit VRAM alongside the judge, which
+    # backfired twice (slow bf16 CPU matmul with no tensor-core support, and
+    # this pod's actual container RAM limit, 50GB, confirmed tighter than
+    # VRAM). Real numbers: gemma-3-4b-it ~8.6GB + judge ~8GB + V_all bf16
+    # L14-32 (19 layers) ~23.8GB ~= 40.3GB of the pod's ~45GB VRAM -- tight
+    # but the same order of headroom the v3 smoke already ran successfully
+    # with (32.4GB of 44GB, single-model). If this OOMs on VRAM specifically
+    # (a CUDA OOM, not a SIGKILL), narrow --layer-hi (e.g. 23-32) or try
+    # --no-judge first to isolate whether the ablation mechanism alone fits.
+    print(f"precomputing W_U . J_l for layers {layers} (once, reused across all rows) ...")
+    unembed_weight = tl.hf.get_output_embeddings().weight
     V_all: dict[int, torch.Tensor] = {}
     for i, l in enumerate(layers, start=1):
         t0 = time.perf_counter()
-        V_all[l] = lens_vectors(tl.lens, unembed_weight_cpu, l)
+        V_all[l] = lens_vectors(tl.lens, unembed_weight, l)
         print(f"  layer {l} ({i}/{len(layers)}) done in {time.perf_counter() - t0:.1f}s", flush=True)
 
     configs = MAIN_CONFIGS if args.config == ["all-main"] else args.config
