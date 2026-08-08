@@ -571,16 +571,26 @@ def main() -> int:
     # already moves only the small per-position candidate slice ([d_model,
     # k], not the full [vocab, d_model] table) to h's device on demand, and
     # causal_sweep.position_candidates already moves the (tiny, [d_model])
-    # residual to V's device rather than the other way around. This DOES
-    # need ~24-48GB of *system* RAM instead (the pod's ~50GB, per
-    # ARCHITECTURE.md's pod spec, should cover the bf16 case) -- if that
-    # turns out tight, narrow --layer-hi (e.g. 23-32 instead of 14-32, the
-    # "tighter/cheaper alternative" already noted for gemma's workspace
-    # band) rather than moving this back onto the GPU.
+    # residual to V's device rather than the other way around.
+    #
+    # ALWAYS float32 for this, regardless of --dtype: CPU matmul has no
+    # reliably fast bf16 kernel on every CPU architecture (same class of gap
+    # already hit once in this repo -- torch.linalg.pinv has no bf16 CPU
+    # kernel at all, see interventions.ablate_span's own upcast). A stuck
+    # 5+ minute hang on this exact line, on a real pod run, is what
+    # surfaced this: the bf16 CPU matmul fell onto a slow path. float32
+    # doubles the RAM cost (~47.5GB for the full L14-32 band) but pod RAM is
+    # generously oversized for this (503GB, confirmed in results/
+    # run_metadata.json) -- CPU compute speed, not RAM, was the real
+    # constraint here.
     print(f"precomputing W_U . J_l for layers {layers} (once, reused across all "
-          f"rows; kept on CPU, not GPU -- see comment above) ...")
-    unembed_weight_cpu = tl.hf.get_output_embeddings().weight.detach().to("cpu")
-    V_all = {l: lens_vectors(tl.lens, unembed_weight_cpu, l) for l in layers}
+          f"rows; kept on CPU in float32, not GPU/bf16 -- see comment above) ...")
+    unembed_weight_cpu = tl.hf.get_output_embeddings().weight.detach().to("cpu").float()
+    V_all: dict[int, torch.Tensor] = {}
+    for i, l in enumerate(layers, start=1):
+        t0 = time.perf_counter()
+        V_all[l] = lens_vectors(tl.lens, unembed_weight_cpu, l)
+        print(f"  layer {l} ({i}/{len(layers)}) done in {time.perf_counter() - t0:.1f}s", flush=True)
 
     configs = MAIN_CONFIGS if args.config == ["all-main"] else args.config
     for config in configs:
