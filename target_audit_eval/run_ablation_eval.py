@@ -340,6 +340,22 @@ def run_config(
         t0 = time.perf_counter()
         prompt = tl.render_prompt(row.target_inst, row.context)
         prompt_tokens = int(tl.model.encode(prompt, max_length=args.max_seq_len).shape[1])
+        if prompt_tokens >= args.max_seq_len:
+            # Same truncation signature already hit once in this repo (see
+            # ARCHITECTURE.md, run_causal_pipeline_piarena.py's --max-seq-len
+            # fix): seq_len landing exactly on the ceiling means the prompt
+            # was cut, not that it happened to be exactly this long. Since
+            # PIArena inserts injected_task at the END of context by default,
+            # a truncated prompt likely never reaches it at all -- the
+            # target model responds to a cut-off context and the judge sees
+            # an injected_task the model was never shown, which is why
+            # asr_completes can come back None/misleading for long-context
+            # configs (_long, up to ~19k tokens) unless --max-seq-len is
+            # raised well above the default 2048.
+            print(f"  [warn] sample_index={sample_index}: prompt_tokens ({prompt_tokens}) "
+                  f"hit --max-seq-len ceiling ({args.max_seq_len}) -- prompt was truncated, "
+                  f"likely cutting off injected_task (PIArena appends it at context's end). "
+                  f"Raise --max-seq-len for this config.")
         response, meta = generate_with_context_ablation(
             tl, prompt, row.context,
             layers=layers, V_all=V_all, k=args.k, guard_top_n=args.guard_top_n,
