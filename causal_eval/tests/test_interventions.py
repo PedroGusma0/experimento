@@ -51,6 +51,7 @@ from interventions import (  # noqa: E402
     InterventionHook,
     ablate,
     ablate_span,
+    ablate_span_per_position,
     lens_vector,
     lens_vectors,
     matched_norm_control,
@@ -102,6 +103,56 @@ def test_ablate_span_zeroes_projection_onto_all_vectors():
     h1 = ablate_span(h, V)
     # h1 is orthogonal to every column of V
     assert (h1 @ V).abs().max() < 1e-4
+
+
+def test_ablate_span_per_position_uses_each_positions_own_subspace():
+    torch.manual_seed(8)
+    h = torch.randn(3, 8)  # 3 "positions" (no batch dim needed for this check)
+    Vs = [torch.randn(8, 2), torch.randn(8, 4), torch.randn(8, 1)]
+    out = ablate_span_per_position(h, Vs)
+    for i, V in enumerate(Vs):
+        torch.testing.assert_close(out[i], ablate_span(h[i], V))
+        assert (out[i] @ V).abs().max() < 1e-4
+
+
+def test_ablate_span_per_position_rejects_mismatched_lengths():
+    h = torch.randn(3, 8)
+    try:
+        ablate_span_per_position(h, [torch.randn(8, 2), torch.randn(8, 2)])
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for len(Vs) != h.shape[-2]")
+
+
+def test_ablate_span_per_position_via_hook_matches_positions_in_order():
+    """Regression: InterventionHook slices `h` via index_select in the same
+    order `positions` was given; ablate_span_per_position must consume that
+    same order, or a subspace would silently land on the wrong position."""
+    model, _ = _model_and_lens()
+    input_ids = model.encode(_PROMPT)
+    layer = 1
+    positions = [5, 20, 35]
+    torch.manual_seed(9)
+    Vs = [torch.randn(8, 2) for _ in positions]
+
+    with ActivationRecorder(model.layers, at=[layer]) as rec:
+        model.forward(input_ids)
+        clean = rec.activations[layer][0].detach().clone()
+
+    with InterventionHook(
+        model.layers,
+        {layer: lambda h: ablate_span_per_position(h, Vs)},
+        positions=positions,
+    ):
+        with ActivationRecorder(model.layers, at=[layer]) as rec:
+            model.forward(input_ids)
+            edited = rec.activations[layer][0].detach().clone()
+
+    for p, V in zip(positions, Vs, strict=True):
+        assert (edited[p] @ V).abs().max() < 1e-4, f"position {p} not ablated by its own V"
+    mask = torch.ones(clean.shape[0], dtype=torch.bool)
+    mask[positions] = False
+    torch.testing.assert_close(edited[mask], clean[mask])
 
 
 def test_matched_norm_control_matches_ablation_norm():

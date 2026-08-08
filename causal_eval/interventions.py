@@ -111,6 +111,36 @@ def ablate_span(h: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     return h - coeffs @ V.to(h.dtype).transpose(-1, -2)
 
 
+def ablate_span_per_position(h: torch.Tensor, Vs: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Per-position variant of :func:`ablate_span`: ``h`` holds several
+    positions along its second-to-last axis (``[..., n_positions, d_model]``),
+    each ablated against its **own** subspace ``Vs[i]`` (``[d_model, k_i]`` —
+    ``k`` may differ per position) instead of one shared ``V`` for all of them.
+
+    Built to be used as an :class:`InterventionHook` edit_fn directly: the
+    hook slices ``h`` down to exactly the requested positions, in the same
+    order as its ``positions`` argument, before calling the edit — so
+    ``lambda h: ablate_span_per_position(h, Vs)`` (with ``Vs`` built in that
+    same position order, e.g. one entry per
+    ``causal_sweep.position_candidates`` call) ablates each intervened
+    position with the candidate set specific to *that* position in a single
+    forward pass, rather than one shared candidate set for the whole span
+    (pipeline v4b's context-only ablation — see ARCHITECTURE.md).
+
+    Args:
+        h: ``[..., n_positions, d_model]`` where ``n_positions == len(Vs)``.
+        Vs: One ``[d_model, k_i]`` subspace per position, in the same order
+            as ``h``'s second-to-last axis.
+    """
+    if h.shape[-2] != len(Vs):
+        raise ValueError(
+            f"h has {h.shape[-2]} positions but {len(Vs)} subspaces were given"
+        )
+    return torch.stack(
+        [ablate_span(h[..., i, :], V) for i, V in enumerate(Vs)], dim=-2
+    )
+
+
 def matched_norm_control(
     h: torch.Tensor, V: torch.Tensor, *, generator: torch.Generator | None = None
 ) -> torch.Tensor:
