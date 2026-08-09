@@ -75,7 +75,7 @@ _OUT_DIR = os.path.join(os.path.dirname(__file__), "results_causal_piarena")
 #: file in Excel/Sheets to eyeball verdict distribution, malign rate, etc.
 #: across the whole PIArena main-eval corpus instead of grepping 26 JSONLs.
 _SUMMARY_CSV_FIELDS = [
-    "sample_index", "config", "variant", "attacked", "verdict", "case",
+    "sample_index", "config", "variant", "verdict", "raw_response", "attacked",
     "gated_to_causal_sweep", "would_call_target_model",
     "target_model_implemented", "seq_len", "n_positions",
     "elapsed_seconds", "guardrail_model",
@@ -91,7 +91,11 @@ def _append_summary_row(path: str, row: dict) -> None:
     header only the first time the file is created (or is empty)."""
     write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=_SUMMARY_CSV_FIELDS)
+        # extrasaction="ignore": readout_row still carries "case" (needed by
+        # the JSONL write above), which is intentionally left out of
+        # _SUMMARY_CSV_FIELDS -- without this, DictWriter raises on any key
+        # not in fieldnames.
+        writer = csv.DictWriter(f, fieldnames=_SUMMARY_CSV_FIELDS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -176,12 +180,12 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
                 print(f"  [warn] sample_index={sample_index}: prompt truncated at "
                       f"--max-seq-len={args.max_seq_len} (seq_len == max_seq_len) -- "
                       f"the verdict below may be based on an incomplete prompt")
-            verdict, _ = gl.classify(prompt, max_seq_len=args.max_seq_len)
+            verdict, raw_response = gl.classify(prompt, max_seq_len=args.max_seq_len)
             case = _case(attacked, verdict)
             gated_to_sweep = verdict == "malign"
 
             n_positions = 0
-            if gated_to_sweep:
+            if gated_to_sweep and not args.skip_sweep:
                 # Anchor p_start/p_end to the rendered CONTEXT span (not
                 # REQUEST, not the fixed system prompt) -- mirrors v2's
                 # seed-anchoring, swapping "seed" for "context" since that's
@@ -235,7 +239,8 @@ def run_variant(gl: GuardrailLens, config: str, variant: str, args: argparse.Nam
             # resolved open question on the blocked branch).
             readout_row = {
                 "sample_index": sample_index, "config": config, "variant": variant,
-                "attacked": attacked, "verdict": verdict, "case": case,
+                "verdict": verdict, "raw_response": raw_response,
+                "attacked": attacked, "case": case,
                 "gated_to_causal_sweep": gated_to_sweep,
                 "would_call_target_model": not gated_to_sweep,
                 "target_model_implemented": False,
@@ -289,6 +294,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--skip-sweep", action="store_true",
+                    help="Classify only, never run the causal sweep even when "
+                    "verdict == malign -- for a quick verdict/raw_response smoke.")
     return p.parse_args()
 
 
