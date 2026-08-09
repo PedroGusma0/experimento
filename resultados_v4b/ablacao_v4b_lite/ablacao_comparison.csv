@@ -1,0 +1,3 @@
+config,n_paired_rows,utility_rate_baseline,utility_rate_ablated,utility_rate_delta,asr_rate_baseline,asr_rate_ablated,asr_rate_delta,toxicity_score_baseline,toxicity_score_ablated,toxicity_score_delta
+lcc_long,1,1.0,1.0,0.0,,,,0.0,0.0,0.0
+TOTAL,1,1.0,1.0,0.0,,,,0.0,0.0,0.0

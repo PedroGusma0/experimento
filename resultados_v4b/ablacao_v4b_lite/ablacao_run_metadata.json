@@ -1,0 +1,37 @@
+{
+  "generated_at": "2026-08-08T22:56:30.034864+00:00",
+  "pipeline": "v4b-lite (context-only ablation, two conditions, no control)",
+  "target_model": "google/gemma-3-4b-it",
+  "judge_model": "Qwen/Qwen3-4B-Instruct-2507",
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "k": 10,
+  "layer_lo": 14,
+  "layer_hi": 32,
+  "guard_top_n": 10,
+  "configs": [
+    "lcc_long"
+  ],
+  "hardware": {
+    "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+    "cpu_count": 96,
+    "total_ram_gb": 503.5,
+    "gpu_available": true,
+    "gpu_count": 1,
+    "gpu_names": [
+      "NVIDIA A40"
+    ],
+    "gpu_total_memory_gb": [
+      44.4
+    ]
+  },
+  "totals": {
+    "n_rows": 1,
+    "wall_clock_seconds": 147.9,
+    "wall_clock_hours": 0.0411,
+    "target_seconds": 147.0,
+    "judge_seconds": 0.9,
+    "avg_seconds_per_row": 147.909,
+    "avg_context_positions_ablated": 2135.0
+  }
+}
